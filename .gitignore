@@ -1,0 +1,26 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# ─── Environment (never commit secrets) ───────────────────────────────────────
+middleware/.env
+.env
+
+# ─── macOS ───────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ─── Arduino build artefacts ─────────────────────────────────────────────────
+firmware/**/*.bin
+firmware/**/*.elf
+firmware/**/*.map
