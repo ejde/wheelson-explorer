@@ -119,8 +119,12 @@ PERSONALITIES: dict[str, dict] = {
 
 RESPONSE_SCHEMA = (
     "\n\nIMPORTANT: Respond with ONLY valid JSON — no markdown fences, no prose before or after.\n"
-    "The 'thought' field must be 2 short sentences maximum.\n"
-    '{"action":"forward|backward|left|right|stop","duration_ms":400,"thought":"2-3 sentences max"}'
+    "Rules: 'thought' is your in-character narration (2 sentences max). "
+    "'observation' is a SHORT, factual, neutral description of what the camera shows "
+    "(objects, layout, colours, distances — no personality, no emotion). "
+    "This observation will be stored as your memory and shown in future cycles.\n"
+    '{"action":"forward|backward|left|right|stop","duration_ms":400,'
+    '"thought":"2 sentences max","observation":"brief factual scene description"}'
 )
 
 VALID_ACTIONS = {"forward", "backward", "left", "right", "stop"}
@@ -137,9 +141,10 @@ class AppState:
     last_distance_cm: float = 999.0
     cycle_count:      int   = 0
     hard_stop_count:  int   = 0
-    action_streak:    int   = 0   # how many times the same action repeated
-    event_log:        list  = field(default_factory=list)
-    is_running:       bool  = False
+    action_streak:       int   = 0   # how many times the same action repeated
+    exploration_memory:  list  = field(default_factory=list)  # capped at 10
+    event_log:           list  = field(default_factory=list)
+    is_running:          bool  = False
 
 
 state = AppState()
@@ -175,8 +180,20 @@ def _system_prompt(personality_key: str) -> str:
 
 
 def _build_prompt(distance_cm: float) -> str:
-    """Build a context-rich prompt including sensor data and action history."""
+    """Build a context-rich prompt: exploration memory + sensor data + streak warnings."""
     dist_str = f"{distance_cm:.1f} cm" if distance_cm < 900 else "clear (>5 m)"
+
+    # ── Exploration memory ──────────────────────────────────────────────
+    mem_lines = ""
+    if state.exploration_memory:
+        entries = "\n".join(
+            f"  [{m['ts']}] {m['action']} {m['duration_ms']}ms, dist {m['distance_cm']}cm"
+            f" → \"{m['observation']}\""
+            for m in state.exploration_memory
+        )
+        mem_lines = f"\nEXPLORATION LOG (what you have seen so far):\n{entries}\n"
+
+    # ── Streak / stuck warning ──────────────────────────────────────────
     streak_warning = ""
     if state.action_streak >= 5 and state.last_action == "forward":
         streak_warning = (
@@ -189,8 +206,10 @@ def _build_prompt(distance_cm: float) -> str:
             f" NOTE: your last {state.action_streak} actions were all '{state.last_action}'. "
             "Consider varying your movement."
         )
+
     return (
-        f"Distance sensor: {dist_str}."
+        f"{mem_lines}"
+        f"Current distance sensor: {dist_str}."
         f" Last action: {state.last_action} (repeated {state.action_streak}x)."
         f"{streak_warning}"
         " Reply with ONLY the JSON."
@@ -275,6 +294,7 @@ async def ask_vlm(
         "action":      action,
         "duration_ms": max(100, min(int(parsed.get("duration_ms", 400)), 3000)),
         "thought":     str(parsed.get("thought", "…")),
+        "observation": str(parsed.get("observation", "")).strip(),
     }
 
 
@@ -393,7 +413,20 @@ async def explorer_loop() -> None:
                 state.last_duration_ms = vlm["duration_ms"]
                 state.cycle_count     += 1
 
-                # 4. Append to rolling event log
+                # 4. Append to exploration memory (factual scene log)
+                if vlm.get("observation"):
+                    mem_entry = {
+                        "ts":          datetime.now().strftime("%H:%M:%S"),
+                        "action":      actual_action,
+                        "duration_ms": vlm["duration_ms"],
+                        "distance_cm": round(distance_cm, 1),
+                        "observation": vlm["observation"],
+                    }
+                    state.exploration_memory.append(mem_entry)
+                    if len(state.exploration_memory) > 10:
+                        state.exploration_memory.pop(0)
+
+                # 5. Append to rolling event log
                 entry = {
                     "ts":          datetime.now().strftime("%H:%M:%S"),
                     "thought":     vlm["thought"],
