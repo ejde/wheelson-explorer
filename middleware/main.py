@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import AsyncGenerator
 
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types as genai_types
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -49,7 +50,16 @@ WHEELSON_IP    = os.getenv("WHEELSON_IP",       "192.168.1.100")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY",    "")
 LOOP_INTERVAL  = float(os.getenv("LOOP_INTERVAL_SEC", "4.0"))
 PORT           = int(os.getenv("PORT",          "8000"))
+GEMINI_MODEL   = "gemini-2.5-flash"   # overridden by --model
+OLLAMA_BASE_URL= os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL   = "llava"               # overridden by --model
 MAX_LOG_SIZE   = 20   # number of entries kept in the event log
+GEMINI_RPM_LIMIT    = 5                        # Gemini free tier: 5 req/min
+GEMINI_MIN_INTERVAL = 60.0 / GEMINI_RPM_LIMIT  # = 12.0 s minimum between requests
+
+# Set at startup from CLI args
+PROVIDER: str = "gemini"   # "gemini" | "ollama"
+ACTIVE_MODEL: str = GEMINI_MODEL
 
 # ─── Personalities ───────────────────────────────────────────────────────────
 PERSONALITIES: dict[str, dict] = {
@@ -108,8 +118,9 @@ PERSONALITIES: dict[str, dict] = {
 }
 
 RESPONSE_SCHEMA = (
-    "\n\nIMPORTANT: Respond with ONLY valid JSON — no markdown fences, no prose before or after:\n"
-    '{"action":"forward|backward|left|right|stop","duration_ms":400,"thought":"your narration here"}'
+    "\n\nIMPORTANT: Respond with ONLY valid JSON — no markdown fences, no prose before or after.\n"
+    "The 'thought' field must be 2 short sentences maximum.\n"
+    '{"action":"forward|backward|left|right|stop","duration_ms":400,"thought":"2-3 sentences max"}'
 )
 
 VALID_ACTIONS = {"forward", "backward", "left", "right", "stop"}
@@ -126,6 +137,7 @@ class AppState:
     last_distance_cm: float = 999.0
     cycle_count:      int   = 0
     hard_stop_count:  int   = 0
+    action_streak:    int   = 0   # how many times the same action repeated
     event_log:        list  = field(default_factory=list)
     is_running:       bool  = False
 
@@ -148,37 +160,106 @@ def broadcast(event: dict) -> None:
     _sse_subscribers.difference_update(dead)
 
 
-# ─── Gemini ──────────────────────────────────────────────────────────────────
-def _build_model(personality_key: str) -> genai.GenerativeModel:
-    p      = PERSONALITIES[personality_key]
-    system = p["system_prompt"] + RESPONSE_SCHEMA
-    return genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=system,
+def flip_jpeg(jpeg_bytes: bytes) -> bytes:
+    """Rotate 180° to correct for inverted camera mounting on the Wheelson."""
+    img = Image.open(io.BytesIO(jpeg_bytes)).rotate(180)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+# ─── VLM ──────────────────────────────────────────────────────────────────
+def _system_prompt(personality_key: str) -> str:
+    p = PERSONALITIES[personality_key]
+    return p["system_prompt"] + RESPONSE_SCHEMA
+
+
+def _build_prompt(distance_cm: float) -> str:
+    """Build a context-rich prompt including sensor data and action history."""
+    dist_str = f"{distance_cm:.1f} cm" if distance_cm < 900 else "clear (>5 m)"
+    streak_warning = ""
+    if state.action_streak >= 5 and state.last_action == "forward":
+        streak_warning = (
+            f" WARNING: you have moved forward {state.action_streak} times in a row "
+            "without changing direction — you are probably stuck against a wall or obstacle. "
+            "You MUST turn left or right NOW."
+        )
+    elif state.action_streak >= 5:
+        streak_warning = (
+            f" NOTE: your last {state.action_streak} actions were all '{state.last_action}'. "
+            "Consider varying your movement."
+        )
+    return (
+        f"Distance sensor: {dist_str}."
+        f" Last action: {state.last_action} (repeated {state.action_streak}x)."
+        f"{streak_warning}"
+        " Reply with ONLY the JSON."
     )
 
 
-async def ask_vlm(
-    model:        genai.GenerativeModel,
-    jpeg_bytes:   bytes,
-    distance_cm:  float,
-) -> dict:
-    """
-    Send the current frame + sensor reading to Gemini.
-    Returns {"action": str, "duration_ms": int, "thought": str}.
-    """
-    img    = Image.open(io.BytesIO(jpeg_bytes))
-    prompt = (
-        f"Distance sensor reading: {distance_cm:.1f} cm. "
-        "Reply with ONLY the JSON as specified."
+async def _ask_gemini(jpeg_bytes: bytes, distance_cm: float, system: str) -> dict:
+    """Call Gemini via google-genai SDK."""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = _build_prompt(distance_cm)
+    contents = [
+        genai_types.Content(role="user", parts=[
+            genai_types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+            genai_types.Part.from_text(text=prompt),
+        ])
+    ]
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=0.4,
     )
     loop = asyncio.get_event_loop()
     resp = await loop.run_in_executor(
         None,
-        lambda: model.generate_content([img, prompt]),
+        lambda: client.models.generate_content(
+            model=ACTIVE_MODEL,
+            contents=contents,
+            config=config,
+        ),
     )
+    return resp.text.strip()
 
-    raw = resp.text.strip()
+
+async def _ask_ollama(
+    jpeg_bytes: bytes,
+    distance_cm: float,
+    system: str,
+    http_client: httpx.AsyncClient,
+) -> str:
+    """Call Ollama local API (/api/generate) — no extra library needed."""
+    img_b64 = base64.b64encode(jpeg_bytes).decode()
+    prompt = _build_prompt(distance_cm)
+    payload = {
+        "model":  ACTIVE_MODEL,
+        "system": system,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+        "options": {"temperature": 0.4},
+    }
+    resp = await http_client.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json=payload,
+        timeout=60.0,   # local models can be slow
+    )
+    resp.raise_for_status()
+    return resp.json()["response"].strip()
+
+
+async def ask_vlm(
+    jpeg_bytes:  bytes,
+    distance_cm: float,
+    system:      str,
+    http_client: httpx.AsyncClient,
+) -> dict:
+    """Dispatch to the active provider and parse the JSON response."""
+    if PROVIDER == "gemini":
+        raw = await _ask_gemini(jpeg_bytes, distance_cm, system)
+    else:
+        raw = await _ask_ollama(jpeg_bytes, distance_cm, system, http_client)
 
     # Strip accidental markdown fences
     if raw.startswith("```"):
@@ -186,7 +267,6 @@ async def ask_vlm(
         raw   = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
 
     parsed = json.loads(raw)
-
     action = str(parsed.get("action", "stop")).lower()
     if action not in VALID_ACTIONS:
         action = "stop"
@@ -218,16 +298,32 @@ async def send_move(
     distance_cm:  float,
 ) -> tuple[str, bool]:
     """
-    POST /move with a middleware-side safety guard.
+    POST /move with middleware-side safety logic:
+    - Hard stop + forced turn if distance < 25 cm and action is forward
+    - Stuck override: if same action repeated 5+ times, force a turn
     Returns (action_sent, safety_fired).
     """
+    import random
     safety_fired = False
-    if distance_cm < 10.0 and action == "forward":
+    recovery_turn = random.choice(["left", "right"])
+
+    # Stuck detection: same non-stop action + times in a row
+    if state.action_streak >= 5 and action == "forward":
         log.warning(
-            "⚠️  [SAFETY] Hard stop triggered! distance=%.1f cm (threshold=10 cm)", distance_cm
+            "⚠️  [STUCK] %d identical forward actions — forcing %s turn",
+            state.action_streak, recovery_turn
+        )
+        action       = recovery_turn
+        safety_fired = True
+
+    # Expanded safety zone: 25 cm (not just 10 cm on the firmware)
+    if distance_cm < 25.0 and action == "forward":
+        log.warning(
+            "⚠️  [SAFETY] Obstacle at %.1f cm — forcing %s turn instead of stop",
+            distance_cm, recovery_turn
         )
         state.hard_stop_count += 1
-        action       = "stop"
+        action       = recovery_turn
         safety_fired = True
 
     payload = {"action": action, "duration_ms": duration_ms}
@@ -238,9 +334,17 @@ async def send_move(
 # ─── Explorer Loop ───────────────────────────────────────────────────────────
 async def explorer_loop() -> None:
     state.is_running = True
-    genai.configure(api_key=GEMINI_API_KEY)
-    model       = _build_model(state.personality_key)
-    personality = PERSONALITIES[state.personality_key]
+    system           = _system_prompt(state.personality_key)
+    personality      = PERSONALITIES[state.personality_key]
+
+    # Enforce Gemini rate limit
+    effective_interval = LOOP_INTERVAL
+    if PROVIDER == "gemini" and LOOP_INTERVAL < GEMINI_MIN_INTERVAL:
+        effective_interval = GEMINI_MIN_INTERVAL
+        log.warning(
+            "⏱  Gemini free tier: max %d req/min — raising interval %.1fs → %.1fs",
+            GEMINI_RPM_LIMIT, LOOP_INTERVAL, effective_interval,
+        )
 
     log.info(
         "🤖 Explorer started  personality=%s %s  interval=%.1fs",
@@ -256,11 +360,12 @@ async def explorer_loop() -> None:
             try:
                 # 1. Capture frame from Wheelson
                 jpeg_bytes, distance_cm = await fetch_frame(client)
+                jpeg_bytes             = flip_jpeg(jpeg_bytes)  # correct inverted mount
                 state.last_frame_b64   = base64.b64encode(jpeg_bytes).decode()
                 state.last_distance_cm = distance_cm
 
                 # 2. Ask the VLM
-                vlm = await ask_vlm(model, jpeg_bytes, distance_cm)
+                vlm = await ask_vlm(jpeg_bytes, distance_cm, system, client)
                 state.last_thought = vlm["thought"]
 
                 log.info(
@@ -277,6 +382,13 @@ async def explorer_loop() -> None:
                 actual_action, safety_fired = await send_move(
                     client, vlm["action"], vlm["duration_ms"], distance_cm
                 )
+
+                # Track action streak for stuck detection
+                if actual_action == state.last_action:
+                    state.action_streak += 1
+                else:
+                    state.action_streak = 1
+
                 state.last_action      = actual_action
                 state.last_duration_ms = vlm["duration_ms"]
                 state.cycle_count     += 1
@@ -316,7 +428,7 @@ async def explorer_loop() -> None:
 
             # Wait for the remainder of the cycle interval
             elapsed = asyncio.get_event_loop().time() - cycle_start
-            await asyncio.sleep(max(0.0, LOOP_INTERVAL - elapsed))
+            await asyncio.sleep(max(0.0, effective_interval - elapsed))
 
 
 # ─── FastAPI Routes ──────────────────────────────────────────────────────────
@@ -401,6 +513,7 @@ async def health() -> JSONResponse:
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 def main() -> None:
     import uvicorn
+    global PROVIDER, ACTIVE_MODEL
 
     parser = argparse.ArgumentParser(
         description="Wheelson Explorer — AI-powered autonomous robot middleware"
@@ -412,10 +525,30 @@ def main() -> None:
         metavar="NAME",
         help=f"Active personality. Choices: {', '.join(PERSONALITIES.keys())}",
     )
+    parser.add_argument(
+        "--provider",
+        choices=["gemini", "ollama"],
+        default="gemini",
+        help="VLM provider: 'gemini' (cloud) or 'ollama' (local). Default: gemini",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help="Model name override. Defaults: gemini=gemini-2.0-flash, ollama=llava",
+    )
     parser.add_argument("--port", type=int, default=PORT, help="Dashboard port (default: 8000)")
     args = parser.parse_args()
 
-    if not GEMINI_API_KEY:
+    PROVIDER = args.provider
+    if args.model:
+        ACTIVE_MODEL = args.model
+    elif PROVIDER == "gemini":
+        ACTIVE_MODEL = GEMINI_MODEL
+    else:
+        ACTIVE_MODEL = OLLAMA_MODEL
+
+    if PROVIDER == "gemini" and not GEMINI_API_KEY:
         log.error("❌  GEMINI_API_KEY is not set. Add it to your .env file and retry.")
         sys.exit(1)
 
@@ -424,6 +557,7 @@ def main() -> None:
     log.info("═" * 55)
     log.info("  Wheelson Autonomous Explorer")
     log.info("  Personality : %s  %s", p["emoji"], p["name"])
+    log.info("  Provider    : %s  (model: %s)", PROVIDER.upper(), ACTIVE_MODEL)
     log.info("  Move bias   : %s",  p["move_bias"])
     log.info("  Wheelson IP : %s",  WHEELSON_IP)
     log.info("  Dashboard   : http://localhost:%d", args.port)
