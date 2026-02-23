@@ -1,296 +1,291 @@
-# Wheelson Explorer 🤖
+# Wheelson Explorer
 
-An autonomous explorer for the CircuitMess Wheelson. The robot streams camera frames over Wi-Fi; a Python middleware feeds them to a Vision-Language Model (Gemini or a local Ollama model), and the VLM's decision steers the motors — all visualised through a live browser dashboard with per-personality voice narration.
+Autonomous exploration stack for CircuitMess Wheelson using a **subsumption-type architecture**:
+- firmware safety/reflexes,
+- deterministic local planning,
+- async VLM scene semantics,
+- persona-specific strategy.
 
-Four **personalities** give the robot a completely different character, narration style, and movement philosophy.
+The system is designed so robot motion remains safe and deterministic even when VLM calls are slow or unavailable.
 
----
+## Architecture (Subsumption-Type)
+
+Control is layered by priority. Higher-priority layers can suppress lower-priority intent.
+
+1. **S0 Firmware Safety (hard realtime-ish)**
+- Lease timeout stop (`lease_timeout` latch)
+- Visual obstacle hard-stop (`visual_obstacle` latch)
+- Exposes camera + telemetry headers + active command metadata
+
+2. **S1 Motion Authority (middleware)**
+- Single writer to `/move` (`MotionSupervisor`)
+- Heartbeat renewal for continuous motion commands
+- Command metadata propagation (`command_id`, `source`, `mode`)
+
+3. **S2 Recovery FSM (middleware)**
+- Deterministic nudge/escape/hard-escape escalation
+- Motion-score based no-progress recovery
+
+4. **S3 Persona Strategist (middleware)**
+- Persona-specific motion doctrine and objectives
+- Distinct policies for `benson`, `sir_david`, `klaus`, `zog7`
+
+5. **S4 Semantic Interpreter (VLM, async advisory)**
+- VLM outputs **scene semantics only** (`frontier`, `traversability`, `novelty`, `hazard`, `headlight`, `observation`)
+- No direct motor commands from VLM
+
+### Control/Dataflow Diagram
+
+```mermaid
+flowchart TD
+    CAM["Wheelson Camera + Telemetry Headers"] --> VLM["S4 Semantic Interpreter (VLM, async)"]
+    CAM --> LSCENE["Local Scene Inference (deterministic fallback)"]
+    VLM --> CONTRACT["Semantic Contract (TTL + Confirm Gates)"]
+    LSCENE --> CONTRACT
+
+    CONTRACT --> STRAT["S3 Persona Strategist (objectives + doctrine)"]
+    STRAT --> REC["S2 Recovery FSM (nudge/escape/hard_escape)"]
+    REC --> AUTH["S1 Motion Authority (single writer + lease heartbeat)"]
+    STRAT --> AUTH
+
+    AUTH --> FW["S0 Firmware Safety (lease timeout + visual hard-stop)"]
+    FW --> MOTORS["Nuvoton Motor Control"]
+
+    TO["VLM Timeout Escalation"] --> MODE["Mode: normal -> degraded -> local_only"]
+    MODE --> STRAT
+```
+
+## VLM Safety Contract
+
+The VLM is intentionally non-blocking and non-authoritative for motion.
+
+- **Async only**: planner continues without waiting for VLM completion.
+- **Semantic TTL**: stale VLM semantics expire (`SEMANTIC_TTL_SEC`).
+- **Confirmation gates**: risky one-frame labels (`hard`, `blocked`) require confirmation across frames.
+- **Timeout escalation**:
+  - stage 1: timeout fallback (pause + scan behavior)
+  - stage 2: degraded mode
+  - stage 3: temporary `local_only` lockout (`STRATEGY_LOCAL_ONLY_SEC`)
+- **Modes**:
+  - `normal`
+  - `degraded`
+  - `local_only`
+
+## Personas (Distinct Strategy Layer)
+
+Each persona has distinct:
+- movement doctrine,
+- objective style,
+- commentary style,
+- degraded/timeout behavior.
+
+| Persona | Movement Signature | Primary Objective Style |
+|---|---|---|
+| `benson` | conservative, safety pauses, risk-first reroutes | compliance/safety sweep |
+| `sir_david` | curiosity arcs, novelty-biased approach/reframe | documentary exploration |
+| `klaus` | perimeter acquisition + wide signature arcs | spatial-flow/perimeter audit |
+| `zog7` | edge-cover seeking, concealment pauses, tactical resets | covert mapping / exposure minimization |
 
 ## Repository Structure
 
-```
+```text
 wheelson-explorer/
 ├── firmware/
 │   └── wheelson_explorer/
-│       └── wheelson_explorer.ino   ← ESP32 firmware (no external libraries)
+│       └── wheelson_explorer.ino
 ├── middleware/
-│   ├── main.py                     ← FastAPI + explorer loop
-│   ├── dashboard.html              ← live browser UI (SSE, Web Speech API)
+│   ├── main.py
+│   ├── dashboard.html
 │   ├── requirements.txt
 │   └── .env.example
-├── .gitignore
 └── README.md
 ```
 
----
+## Hardware Notes
 
-## Hardware Requirements
+- CircuitMess Wheelson (ESP32)
+- 2.4 GHz Wi-Fi
+- Camera is primary perception channel
 
-| Item | Notes |
-|------|-------|
-| CircuitMess Wheelson | Any hardware revision (ESP32-D0WDQ6) |
-| HC-SR04 Ultrasonic Sensor | Wired to GPIO 13 (TRIG) / GPIO 12 (ECHO) |
-| USB cable (Micro-USB) | For flashing only — runs untethered after |
-| Wi-Fi network (2.4 GHz) | Wheelson does not support 5 GHz |
+### Ultrasonic Status
 
-### HC-SR04 Wiring
+The current stack treats ultrasonic as unavailable in runtime planning/safety.
+- Middleware distance is treated as `999.0cm` placeholder.
+- Firmware safety uses **visual obstacle telemetry** and lease safety.
 
-```
-HC-SR04 VCC  →  Wheelson 3.3 V or 5 V
-HC-SR04 GND  →  Wheelson GND
-HC-SR04 TRIG →  GPIO 13
-HC-SR04 ECHO →  GPIO 12  (add a 1 kΩ / 2 kΩ voltage divider if powering at 5 V)
-```
+## Firmware
 
-> To use different pins, update `#define TRIG_PIN` and `#define ECHO_PIN` at the top of `wheelson_explorer.ino`.
+File: `firmware/wheelson_explorer/wheelson_explorer.ino`
 
----
+### Arduino Setup
 
-## Firmware Setup
+- Board: `ESP32 Dev Module`
+- Partition: `Huge APP (3MB No OTA/1MB SPIFFS)`
+- PSRAM: `Enabled`
+- Upload speed: `115200` if high-speed uploads fail
 
-### Prerequisites
+Set Wi-Fi credentials in the sketch:
 
-1. **Arduino IDE 2.x** — [download](https://www.arduino.cc/en/software)
-2. **ESP32 board support** — *File → Preferences → Additional Boards Manager URLs*, add:
-   ```
-   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-   ```
-   Then *Tools → Board → Boards Manager* → search **esp32** → install **esp32 by Espressif Systems**.
-
-> **No external libraries required.** The firmware uses only the ESP32 Arduino core (`WiFi.h`, `WebServer.h`, `Wire.h`, `esp_camera.h`). JSON is handled with plain `String` helpers.
-
-### Arduino IDE Board Settings (critical)
-
-| Setting | Value |
-|---------|-------|
-| Board | `ESP32 Dev Module` |
-| Partition Scheme | `Huge APP (3MB No OTA / 1MB SPIFFS)` |
-| **PSRAM** | **`Enabled`** ← required for camera frame buffer |
-| Upload Speed | `115200` ← use this if the default 921600 causes upload errors |
-| Port | `/dev/cu.usbserial-XXXX` (macOS) |
-
-### Flashing
-
-1. Open `firmware/wheelson_explorer/wheelson_explorer.ino`.
-2. Edit the Wi-Fi credentials near the top:
-   ```cpp
-   #define WIFI_SSID     "YourNetworkName"
-   #define WIFI_PASSWORD "YourPassword"
-   ```
-3. Apply the board settings above (especially **PSRAM → Enabled** and upload speed **115200**).
-4. Connect Wheelson via USB, then click **Upload**.
-
-#### Upload troubleshooting
-
-If you see `The chip stopped responding` or `StopIteration` in the esptool output:
-
-- **Set Upload Speed to 115200** — the default 921600 drops out on many USB-to-serial adapters.
-- **Hold the BOOT button** — while the IDE shows `Connecting……`, hold the physical BOOT button for 2 s, then release. This forces the ESP32 into bootloader mode.
-- **Check your USB cable** — charge-only cables have no data lines; the upload will fail silently.
-
-### Verify Firmware
-
-Open **Serial Monitor** at **115200 baud** and press the reset button. You should see:
-
-```
-╔══════════════════════════════════╗
-║  Wheelson Autonomous Explorer    ║
-╚══════════════════════════════════╝
-[NUVOTON] Reset complete
-[MOTORS] I2C ready
-[CAMERA] Ready (160×120 JPEG)
-[WIFI] Connecting to 'YourNetwork'......
-[WIFI] Connected! IP: 192.168.1.112
-[HTTP] Server started on port 80
+```cpp
+#define WIFI_SSID "WIFI_SSID"
+#define WIFI_PASSWORD "WIFI_PASSWORD"
 ```
 
-Then smoke-test the endpoints:
+### Firmware API
 
-```bash
-# Live camera frame (open in browser)
-open http://192.168.1.112/camera
+#### `GET /camera`
+Returns JPEG bytes plus telemetry headers:
 
-# Status JSON
-curl http://192.168.1.112/status
+- `X-Distance-CM`
+- `X-Raw-Pulse-US`
+- `X-Visual-Obstacle`
+- `X-Obstacle-Left-Ratio`
+- `X-Obstacle-Right-Ratio`
+- `X-Nav-State`
+- `X-Brightness`
+- `X-Dominant-Color`
+- `X-Active-Command-Id`
+- `X-Active-Command-Source`
+- `X-Active-Command-Mode`
+- `X-Safety-Latched`
+- `X-Safety-Reason`
 
-# Test move command (should spin wheels for 500 ms)
-curl -X POST http://192.168.1.112/move \
-  -H "Content-Type: application/json" \
-  -d '{"action":"forward","duration_ms":500}'
+#### `GET /status`
+Returns state JSON including:
+
+- `distance_cm`, `ip`
+- `nav_state`
+- `command_id`, `source`, `mode`
+- `safety_latched`, `safety_reason`
+
+#### `POST /move`
+Supports command metadata:
+
+- `command_id`
+- `source`
+- `mode`
+
+Supported payload forms:
+
+```json
+{ "command": "set_speed", "level": "slow|medium|fast", "command_id": "...", "source": "...", "mode": "..." }
 ```
 
-> **Unplug and run on battery** — once flashed, the firmware runs on any USB power source. Wheelson will auto-connect to Wi-Fi on boot.
+```json
+{ "command": "set_light", "level": "0..255", "command_id": "...", "source": "...", "mode": "..." }
+```
 
----
+```json
+{ "command": "move_indefinitely", "direction": "forward|backward|left|right|stop", "command_id": "...", "source": "...", "mode": "..." }
+```
 
-## Middleware Setup
+```json
+{ "action": "forward|backward|left|right|stop", "duration_ms": 500, "command_id": "...", "source": "...", "mode": "..." }
+```
 
-### Prerequisites
+## Middleware
 
-- Python 3.10+
-- One of the following VLM providers:
-  - **Gemini** — [Google AI Studio API key](https://aistudio.google.com/app/apikey) (free tier: 5 req/min)
-  - **Ollama** — [install Ollama](https://ollama.com/download) and pull a vision model
+File: `middleware/main.py`
 
 ### Install
 
 ```bash
 cd middleware
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### Configure
-
-```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+### Core Environment Variables
 
 ```env
-WHEELSON_IP=192.168.1.112        # IP printed in Serial Monitor on boot
-GEMINI_API_KEY=AIza...           # only needed for --provider gemini
-LOOP_INTERVAL_SEC=4.0            # seconds between VLM cycles
-                                 # (Gemini free tier auto-raises this to 12 s)
+WHEELSON_IP=192.168.1.112
+GEMINI_API_KEY=...
+LOOP_INTERVAL_SEC=4.0
 PORT=8000
-OLLAMA_BASE_URL=http://localhost:11434   # optional, default shown
+OLLAMA_BASE_URL=http://localhost:11434
 ```
 
-### Run — Gemini provider
+### Important Optional Controls
+
+```env
+# VLM timing
+OLLAMA_STRATEGY_MIN_INTERVAL_SEC=8.0
+OLLAMA_VLM_TIMEOUT_SEC=14.0
+OLLAMA_TIMEOUT_BACKOFF_SEC=24.0
+
+# Semantic contract
+SEMANTIC_TTL_SEC=18.0
+SEMANTIC_HARD_CONFIRM_FRAMES=2
+SEMANTIC_BLOCKED_CONFIRM_FRAMES=2
+
+# Timeout escalation
+STRATEGY_TIMEOUT_WINDOW_SEC=90.0
+STRATEGY_TIMEOUT_STAGE2_COUNT=2
+STRATEGY_TIMEOUT_STAGE3_COUNT=3
+STRATEGY_LOCAL_ONLY_SEC=60.0
+
+# Persona strategy tuning
+FORWARD_BURST_DEFAULT_MS=850
+KLAUS_ARC_INTERVAL=3
+KLAUS_ARC_TURN_MS=760
+TIMEOUT_SCAN_STEPS=2
+TIMEOUT_SCAN_TURN_MS=700
+```
+
+### Run
 
 ```bash
-# Default model: gemini-2.0-flash
-python main.py --provider gemini --personality sir_david
+# Gemini
+python main.py --provider gemini --personality benson
 
-# Explicitly choose a model
-python main.py --provider gemini --model gemini-2.5-flash --personality benson
+# Ollama
+python main.py --provider ollama --model llava --personality klaus
 ```
 
-**Gemini rate limiting** — the free tier allows 5 requests per minute. The middleware automatically enforces a 12-second minimum cycle interval when `--provider gemini` is active, regardless of `LOOP_INTERVAL_SEC`.
+CLI:
 
-Available Gemini models (as of Feb 2026):
-
-| Model | Notes |
-|-------|-------|
-| `gemini-2.0-flash` | Default — fast, vision-capable, stable |
-| `gemini-2.5-flash` | Newer, slightly smarter |
-| `gemini-2.5-pro` | Best reasoning, slower |
-| `gemini-2.0-flash-lite` | Fastest, smallest |
-
-### Run — Ollama provider (local, no rate limits)
-
-```bash
-# Pull a vision-capable model first (one-time)
-ollama pull llava          # 4.7 GB — recommended
-ollama pull llava:13b      # 8 GB — better reasoning
-ollama pull moondream      # 1.7 GB — fastest, less accurate
-
-# Run
-python main.py --provider ollama --model llava --personality zog7
-
-# Verify Ollama is running
-curl http://localhost:11434          # should print "Ollama is running"
-ollama list                          # shows installed models
-```
-
-**Ollama requires a vision-capable model.** Text-only models (`qwen2.5-coder`, `llama3`, etc.) will not understand the camera images.
-
----
-
-## Personalities
-
-| Key | Name | Character | Voice (Web Speech API) |
-|-----|------|-----------|------------------------|
-| `benson` | BENSON 🦺 | Health & Safety inspector | Alex / Daniel (authoritative) |
-| `sir_david` | Sir David 🎙️ | Nature documentary narrator | Daniel / Arthur (British) |
-| `klaus` | Klaus 🎨 | Interior designer (appalled) | Martha / Victoria (stern) |
-| `zog7` | Zog-7 👾 | Alien scout | Zarvox / Trinoids (robotic) |
-
-Each personality injects a custom **system prompt** and receives context-rich per-cycle prompts:
-
-```
-Distance sensor: 42.3 cm. Last action: forward (repeated 2x). Reply with ONLY the JSON.
-```
-
-The VLM responds with:
-
-```json
-{
-  "action": "forward",
-  "duration_ms": 400,
-  "thought": "A filing cabinet. Utterly beige. Moving on."
-}
-```
-
----
-
-## Safety
-
-Two independent safety layers prevent collisions:
-
-| Layer | Trigger | Response |
-|-------|---------|----------|
-| **Middleware** (25 cm zone) | `distance_cm < 25` and action is `forward` | Replaces action with a random left/right turn |
-| **Stuck detection** | Same `forward` action 5× in a row | Forces a random turn regardless of VLM output |
-| **LLM context** | Streak ≥ 5 | Prompt warns "you are probably stuck — turn NOW" |
-| **Firmware** (10 cm hard stop) | `distance_cm < 10` and action is `forward` | Overrides to `stop` at the hardware level |
-
----
-
-## Dashboard
-
-Open **http://localhost:8000** after starting the middleware.
-
-| Element | Description |
-|---------|-------------|
-| 📷 Camera feed | Live JPEG, auto-flipped 180° (corrects inverted camera mount) |
-| 💬 Thought bubble | VLM narration with fast typewriter animation |
-| 🔊 Voice | Web Speech API — personality-specific voice, mute button in header |
-| 🟢 Action badge | Color-coded: green=forward, red=stop, yellow=turn, orange=backward |
-| 📏 Distance meter | Bar + value; amber < 30 cm, red < 10 cm |
-| 📜 Event log | Rolling log of last 20 thoughts + actions |
-
-**Voice note** — browsers require a user gesture before playing audio. Click the **🔊 VOICE** button once after loading the page; any thought that arrived before you clicked will play immediately.
-
----
-
-## CLI Reference
-
-```
+```text
 python main.py [--provider gemini|ollama] [--model MODEL] [--personality NAME] [--port PORT]
-
---provider   gemini (default) or ollama
---model      model name; defaults: gemini-2.0-flash / llava
---personality  benson | sir_david | klaus | zog7  (default: benson)
---port       dashboard port (default: 8000, overrides $PORT)
 ```
 
----
+## Runtime Telemetry / Health
 
-## Firmware API Reference
+### Dashboard
 
-### `GET /camera`
-Returns raw JPEG bytes.  
-`X-Distance-CM` response header: current HC-SR04 reading in cm.
+Default: [http://localhost:8000](http://localhost:8000)
 
-### `GET /status`
-```json
-{ "distance_cm": "42.6", "ip": "192.168.1.112" }
-```
+### `GET /health` (middleware)
 
-### `POST /move`
-```json
-{ "action": "forward|backward|left|right|stop", "duration_ms": 500 }
-```
-Response:
-```json
-{ "ok": true, "action": "forward", "duration_ms": 500, "distance_cm": "42.6", "safety": false }
-```
-`"safety": true` means the firmware's hard-stop overrode the requested action.
+Includes high-value runtime state:
 
----
+- `strategy_source`
+- `strategy_mode`
+- `strategy_degraded_level`
+- `strategy_age_sec`
+- `semantic_confidence`
+- `semantic_pending_hard`
+- `semantic_pending_blocked`
+- `vlm_timeout_count`
+- `vlm_disabled_remaining_sec`
+- scene fields (`scene_frontier`, `scene_traversability`, `scene_novelty`, `scene_hazard`)
+- command authority fields (`command_id`, `command_source`, `command_mode`)
+
+## How Persona Interacts with VLM Now
+
+- VLM does **not** roleplay personas and does **not** emit actions.
+- Persona is applied in two safe ways:
+  1. **Salience hints** to VLM prompt (what to notice in scene interpretation).
+  2. **Local strategist doctrine** for movement/objectives/commentary.
+
+This preserves deterministic control while still allowing persona-specific behavior.
+
+## Known Operational Guidance
+
+- If Ollama is slow or timing out, robot continues in local mode with staged degradation.
+- `nav=HOLD` is expected when using timed motion pulses (`duration_ms > 0`).
+- Prefer local vision telemetry and motion consistency metrics over ultrasonic.
 
 ## License
 

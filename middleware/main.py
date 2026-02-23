@@ -69,6 +69,13 @@ OLLAMA_STRATEGY_MIN_INTERVAL = float(os.getenv("OLLAMA_STRATEGY_MIN_INTERVAL_SEC
 OLLAMA_VLM_TIMEOUT_SEC = float(os.getenv("OLLAMA_VLM_TIMEOUT_SEC", "14.0"))
 OLLAMA_TIMEOUT_BACKOFF_SEC = float(os.getenv("OLLAMA_TIMEOUT_BACKOFF_SEC", "24.0"))
 STRATEGY_STALE_MULTIPLIER = 2.0
+SEMANTIC_TTL_SEC = float(os.getenv("SEMANTIC_TTL_SEC", "18.0"))
+SEMANTIC_HARD_CONFIRM_FRAMES = int(os.getenv("SEMANTIC_HARD_CONFIRM_FRAMES", "2"))
+SEMANTIC_BLOCKED_CONFIRM_FRAMES = int(os.getenv("SEMANTIC_BLOCKED_CONFIRM_FRAMES", "2"))
+STRATEGY_TIMEOUT_WINDOW_SEC = float(os.getenv("STRATEGY_TIMEOUT_WINDOW_SEC", "90.0"))
+STRATEGY_TIMEOUT_STAGE2_COUNT = int(os.getenv("STRATEGY_TIMEOUT_STAGE2_COUNT", "2"))
+STRATEGY_TIMEOUT_STAGE3_COUNT = int(os.getenv("STRATEGY_TIMEOUT_STAGE3_COUNT", "3"))
+STRATEGY_LOCAL_ONLY_SEC = float(os.getenv("STRATEGY_LOCAL_ONLY_SEC", "60.0"))
 
 LEASE_HEARTBEAT_SEC = 0.4
 LEASE_MISSED_LIMIT = 3
@@ -231,6 +238,12 @@ PERSONA_POLICIES: dict[str, dict] = {
         "hold_bias": 0.1,
     },
 }
+PERSONA_SALIENCE: dict[str, str] = {
+    "benson": "Prioritize hazards, unstable footing, clutter, cables, and human proximity risk.",
+    "sir_david": "Prioritize visually novel subjects, plants, pets, textures, and interesting light.",
+    "klaus": "Prioritize perimeter lines, wall continuity, furniture flow, and circulation constraints.",
+    "zog7": "Prioritize exposure vs cover, bright zones, moving silhouettes, and concealment routes.",
+}
 
 
 class VLMResponseError(Exception):
@@ -305,6 +318,13 @@ class AppState:
     # Strategy tracking
     last_strategy_source: str = "bootstrap"
     last_strategy_update_ts: float = 0.0
+    strategy_mode: str = "normal"
+    strategy_degraded_level: int = 0
+    semantic_confidence: float = 0.5
+    semantic_pending_hard: int = 0
+    semantic_pending_blocked: int = 0
+    vlm_timeout_count: int = 0
+    vlm_disabled_until_ts: float = 0.0
     last_vlm_headlight_pref: bool = False
     last_scene_frontier: str = "unknown"
     last_scene_traversability: str = "medium"
@@ -498,11 +518,12 @@ def _normalize_vlm_json(raw: str) -> str:
 # VLM integration
 # ---------------------------------------------------------------------------
 def _system_prompt(personality_key: str) -> str:
-    _ = personality_key
-    return SCENE_INTERPRETER_PROMPT + RESPONSE_SCHEMA
+    salience = PERSONA_SALIENCE.get(personality_key, PERSONA_SALIENCE["benson"])
+    return SCENE_INTERPRETER_PROMPT + f" Salience profile: {salience}" + RESPONSE_SCHEMA
 
 
 def _build_prompt(telemetry: dict) -> str:
+    salience = PERSONA_SALIENCE.get(state.personality_key, PERSONA_SALIENCE["benson"])
     mem_lines = ""
     if state.exploration_memory:
         entries = "\n".join(
@@ -530,6 +551,7 @@ def _build_prompt(telemetry: dict) -> str:
         f" Dominant Floor Color={telemetry.get('dominant_color', 'Unknown')}."
         f" Firmware nav state: {telemetry.get('nav_state', 'UNKNOWN')}."
         f" Side obstacle ratios: left={telemetry.get('obstacle_left_ratio', 0.0):.2f}, right={telemetry.get('obstacle_right_ratio', 0.0):.2f}."
+        f" Persona salience hints: {salience}"
         f"{obs_warn}"
         f" Last planner objective: {state.last_objective}."
         f" Last action: {state.last_action} (repeated {state.action_streak}x)."
@@ -669,6 +691,57 @@ def _normalize_hazard(value: str) -> HazardLevel | None:
     if v in {"none", "soft", "hard"}:
         return v  # type: ignore[return-value]
     return None
+
+
+def _apply_vlm_semantic_contract(vlm_scene: dict, telemetry: dict) -> tuple[dict, float, str]:
+    """Gate unstable semantic jumps from a single VLM frame."""
+    frontier = _normalize_frontier(str(vlm_scene.get("frontier", ""))) or "unknown"
+    traversability = _normalize_scene_level(str(vlm_scene.get("traversability", ""))) or "medium"
+    novelty = _normalize_scene_level(str(vlm_scene.get("novelty", ""))) or "medium"
+    hazard = _normalize_hazard(str(vlm_scene.get("hazard", ""))) or "none"
+
+    visual_obstacle = bool(telemetry.get("visual_obstacle", False))
+    side_peak = max(
+        telemetry.get("obstacle_left_ratio", 0.0),
+        telemetry.get("obstacle_right_ratio", 0.0),
+    )
+    hard_evidence = visual_obstacle or side_peak >= 0.35
+    blocked_evidence = visual_obstacle or side_peak >= 0.30
+
+    notes: list[str] = []
+    confidence = 0.8
+
+    if hazard == "hard" and not hard_evidence:
+        state.semantic_pending_hard += 1
+        if state.semantic_pending_hard < SEMANTIC_HARD_CONFIRM_FRAMES:
+            hazard = "soft"
+            confidence = min(confidence, 0.45)
+            notes.append("hard_unconfirmed")
+    else:
+        state.semantic_pending_hard = SEMANTIC_HARD_CONFIRM_FRAMES if hazard == "hard" else 0
+
+    if frontier == "blocked" and not blocked_evidence:
+        state.semantic_pending_blocked += 1
+        if state.semantic_pending_blocked < SEMANTIC_BLOCKED_CONFIRM_FRAMES:
+            frontier = "unknown"
+            confidence = min(confidence, 0.45)
+            notes.append("blocked_unconfirmed")
+    else:
+        state.semantic_pending_blocked = SEMANTIC_BLOCKED_CONFIRM_FRAMES if frontier == "blocked" else 0
+
+    if hazard == "none" and frontier == "forward" and side_peak < 0.03 and not visual_obstacle:
+        confidence = min(confidence, 0.7)
+
+    vetted = {
+        "observation": str(vlm_scene.get("observation", "")).strip(),
+        "headlight": _as_bool(vlm_scene.get("headlight", False)),
+        "frontier": frontier,
+        "traversability": traversability,
+        "novelty": novelty,
+        "hazard": hazard,
+    }
+    reason = ",".join(notes) if notes else "ok"
+    return vetted, confidence, reason
 
 
 def _infer_frontier(telemetry: dict) -> SceneFrontier:
@@ -988,12 +1061,13 @@ class IntentPlanner:
 
     def _strategy_timeout_plan(self, speed_level: str, telemetry: dict) -> MotionPlan | None:
         if bool(telemetry.get("strategy_timeout_event", False)):
-            self.timeout_scan_budget = max(self.timeout_scan_budget, TIMEOUT_SCAN_STEPS)
+            requested_steps = _safe_int(telemetry.get("timeout_scan_steps", TIMEOUT_SCAN_STEPS), TIMEOUT_SCAN_STEPS)
+            self.timeout_scan_budget = max(self.timeout_scan_budget, max(1, requested_steps))
 
         if self.timeout_scan_budget <= 0:
             return None
 
-        if self.timeout_scan_budget == TIMEOUT_SCAN_STEPS:
+        if self.timeout_scan_budget == max(1, _safe_int(telemetry.get("timeout_scan_steps", TIMEOUT_SCAN_STEPS), TIMEOUT_SCAN_STEPS)):
             plan = MotionPlan(
                 action="stop",
                 duration_ms=0,
@@ -1039,6 +1113,18 @@ class IntentPlanner:
         if cycle_count < STARTUP_SLOW_CYCLES:
             cap = "slow"
             reasons.append("startup")
+
+        degraded_level = _safe_int(telemetry.get("strategy_degraded_level", 0), 0)
+        if degraded_level >= 2:
+            cap = "slow"
+            reasons.append("local_only")
+        elif degraded_level >= 1 and cap == "fast":
+            cap = "medium"
+            reasons.append("degraded")
+
+        if float(telemetry.get("semantic_confidence", 0.5)) < 0.55:
+            cap = "slow"
+            reasons.append("low_conf")
 
         effective_rank = min(rank.get(base, 1), rank.get(cap, 1))
         speed = "slow"
@@ -1751,6 +1837,13 @@ async def explorer_loop() -> None:
     loop = asyncio.get_running_loop()
     state.last_strategy_source = "bootstrap"
     state.last_strategy_update_ts = loop.time()
+    state.strategy_mode = "normal"
+    state.strategy_degraded_level = 0
+    state.semantic_confidence = 0.55
+    state.semantic_pending_hard = 0
+    state.semantic_pending_blocked = 0
+    state.vlm_timeout_count = 0
+    state.vlm_disabled_until_ts = 0.0
 
     strategy_refresh_interval = (
         GEMINI_MIN_INTERVAL if PROVIDER == "gemini" else OLLAMA_STRATEGY_MIN_INTERVAL
@@ -1777,6 +1870,40 @@ async def explorer_loop() -> None:
         last_vlm_request_ts = 0.0
         vlm_backoff_until_ts = 0.0
         vlm_task: asyncio.Task | None = None
+        vlm_timeout_events: list[float] = []
+
+        def _prune_vlm_timeouts(now_ts: float) -> None:
+            nonlocal vlm_timeout_events
+            vlm_timeout_events = [t for t in vlm_timeout_events if (now_ts - t) <= STRATEGY_TIMEOUT_WINDOW_SEC]
+
+        def _update_strategy_mode(now_ts: float) -> None:
+            _prune_vlm_timeouts(now_ts)
+            state.vlm_timeout_count = len(vlm_timeout_events)
+            if now_ts < state.vlm_disabled_until_ts:
+                state.strategy_mode = "local_only"
+                state.strategy_degraded_level = 2
+                return
+            if state.vlm_timeout_count >= STRATEGY_TIMEOUT_STAGE2_COUNT or state.last_strategy_source != "vlm":
+                state.strategy_mode = "degraded"
+                state.strategy_degraded_level = 1
+                return
+            state.strategy_mode = "normal"
+            state.strategy_degraded_level = 0
+
+        def _register_vlm_timeout(now_ts: float) -> tuple[int, int]:
+            vlm_timeout_events.append(now_ts)
+            _prune_vlm_timeouts(now_ts)
+            timeout_count = len(vlm_timeout_events)
+
+            stage = 1
+            if timeout_count >= STRATEGY_TIMEOUT_STAGE3_COUNT:
+                stage = 3
+                state.vlm_disabled_until_ts = max(state.vlm_disabled_until_ts, now_ts + STRATEGY_LOCAL_ONLY_SEC)
+            elif timeout_count >= STRATEGY_TIMEOUT_STAGE2_COUNT:
+                stage = 2
+
+            scan_steps = TIMEOUT_SCAN_STEPS + (stage - 1)
+            return stage, scan_steps
 
         async def request_strategy(frame_bytes: bytes, frame_telemetry: dict) -> dict:
             if PROVIDER == "ollama":
@@ -1787,9 +1914,12 @@ async def explorer_loop() -> None:
             return await ask_vlm(frame_bytes, frame_telemetry, system, client)
 
         async def stop_with_failsafe(reason: str) -> None:
-            nonlocal vlm_task
+            nonlocal vlm_task, vlm_timeout_events
             log.warning("🛑 [FAILSAFE] %s", reason)
             recovery.reset()
+            vlm_timeout_events = []
+            state.strategy_mode = "degraded"
+            state.strategy_degraded_level = 2
             state.visual_stall_count = 0
             state.visual_stall_samples = 0
             state.no_progress_count = 0
@@ -1831,21 +1961,25 @@ async def explorer_loop() -> None:
                     now_ts = loop.time()
                     fresh_observation = ""
                     strategy_timeout_event = False
+                    timeout_scan_steps = TIMEOUT_SCAN_STEPS
 
                     # Consume completed VLM task
                     if vlm_task and vlm_task.done():
                         try:
                             vlm_update = vlm_task.result()
+                            vetted_scene, semantic_conf, contract_note = _apply_vlm_semantic_contract(vlm_update, telemetry)
                             vlm_backoff_until_ts = 0.0
-                            state.last_vlm_headlight_pref = vlm_update.get("headlight", False)
-                            state.last_scene_frontier = str(vlm_update.get("frontier", "unknown"))
-                            state.last_scene_traversability = str(vlm_update.get("traversability", "medium"))
-                            state.last_scene_novelty = str(vlm_update.get("novelty", "medium"))
-                            state.last_scene_hazard = str(vlm_update.get("hazard", "none"))
-                            state.last_scene_observation = str(vlm_update.get("observation", ""))
+                            state.last_vlm_headlight_pref = vetted_scene.get("headlight", False)
+                            state.last_scene_frontier = str(vetted_scene.get("frontier", "unknown"))
+                            state.last_scene_traversability = str(vetted_scene.get("traversability", "medium"))
+                            state.last_scene_novelty = str(vetted_scene.get("novelty", "medium"))
+                            state.last_scene_hazard = str(vetted_scene.get("hazard", "none"))
+                            state.last_scene_observation = str(vetted_scene.get("observation", ""))
+                            state.semantic_confidence = semantic_conf
                             state.last_strategy_source = "vlm"
                             state.last_strategy_update_ts = now_ts
                             fresh_observation = state.last_scene_observation
+                            vlm_timeout_events = []
                             log.info(
                                 "🧠 [VLM_SCENE] frontier=%s trav=%s novelty=%s hazard=%s",
                                 state.last_scene_frontier,
@@ -1853,26 +1987,36 @@ async def explorer_loop() -> None:
                                 state.last_scene_novelty,
                                 state.last_scene_hazard,
                             )
+                            if contract_note != "ok":
+                                log.info("🧠 [SEMANTIC_CONTRACT] %s (conf=%.2f)", contract_note, semantic_conf)
                         except asyncio.TimeoutError:
                             if PROVIDER == "ollama":
                                 log.warning(
                                     "🤖 [VLM] ollama refresh timed out after %.1fs; keeping previous strategy",
                                     OLLAMA_VLM_TIMEOUT_SEC,
                                 )
+                                stage, timeout_scan_steps = _register_vlm_timeout(now_ts)
+                                if stage >= 3:
+                                    log.warning(
+                                        "🤖 [VLM] timeout escalation -> local_only for %.0fs (count=%d)",
+                                        STRATEGY_LOCAL_ONLY_SEC,
+                                        len(vlm_timeout_events),
+                                    )
                                 vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + OLLAMA_TIMEOUT_BACKOFF_SEC)
                                 strategy_timeout_event = True
                             else:
                                 log.warning("🤖 [VLM] gemini request timed out; switching to local scene fallback")
                                 vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + strategy_refresh_interval)
-                            state.last_strategy_update_ts = now_ts - strategy_stale_interval
+                            state.last_strategy_update_ts = now_ts - max(strategy_stale_interval, SEMANTIC_TTL_SEC)
                         except VLMResponseError as exc:
                             log.warning(
                                 "🤖 [VLM] %s parse failure: %s; switching to local scene fallback",
                                 PROVIDER,
                                 _exc_summary(exc),
                             )
+                            state.semantic_confidence = min(state.semantic_confidence, 0.45)
                             vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + strategy_refresh_interval)
-                            state.last_strategy_update_ts = now_ts - strategy_stale_interval
+                            state.last_strategy_update_ts = now_ts - max(strategy_stale_interval, SEMANTIC_TTL_SEC)
                         except Exception as exc:
                             if _is_vlm_quota_error(exc):
                                 log.warning(
@@ -1888,13 +2032,17 @@ async def explorer_loop() -> None:
                                     _exc_summary(exc),
                                 )
                                 vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + strategy_refresh_interval)
-                            state.last_strategy_update_ts = now_ts - strategy_stale_interval
+                            state.semantic_confidence = min(state.semantic_confidence, 0.45)
+                            state.last_strategy_update_ts = now_ts - max(strategy_stale_interval, SEMANTIC_TTL_SEC)
                         finally:
                             vlm_task = None
+
+                    _update_strategy_mode(now_ts)
 
                     should_refresh_vlm = (
                         vlm_task is None
                         and now_ts >= vlm_backoff_until_ts
+                        and now_ts >= state.vlm_disabled_until_ts
                         and (
                             state.last_strategy_update_ts <= 0.0
                             or (now_ts - last_vlm_request_ts) >= strategy_refresh_interval
@@ -1909,7 +2057,10 @@ async def explorer_loop() -> None:
                         if state.last_strategy_update_ts > 0.0
                         else float("inf")
                     )
-                    if state.last_strategy_update_ts <= 0.0 or strategy_age >= strategy_stale_interval:
+                    strategy_semantic_expired = (
+                        state.last_strategy_update_ts <= 0.0 or strategy_age >= SEMANTIC_TTL_SEC
+                    )
+                    if strategy_semantic_expired:
                         local_scene = _local_scene_assessment(telemetry)
                         prev_source = state.last_strategy_source
                         state.last_vlm_headlight_pref = local_scene["headlight"]
@@ -1921,6 +2072,9 @@ async def explorer_loop() -> None:
                             state.last_scene_observation = str(local_scene["observation"])
                         state.last_strategy_source = "local"
                         state.last_strategy_update_ts = now_ts
+                        state.semantic_confidence = 0.55
+                        state.semantic_pending_hard = max(0, state.semantic_pending_hard - 1)
+                        state.semantic_pending_blocked = max(0, state.semantic_pending_blocked - 1)
                         if prev_source != "local":
                             log.info(
                                 "🧠 [LOCAL_SCENE] nav=%s light=%s side(L=%.2f R=%.2f) -> frontier=%s hazard=%s",
@@ -1932,10 +2086,16 @@ async def explorer_loop() -> None:
                                 state.last_scene_hazard,
                             )
 
+                    _update_strategy_mode(now_ts)
+
                     telemetry["strategy_timeout_event"] = strategy_timeout_event
+                    telemetry["timeout_scan_steps"] = timeout_scan_steps
                     telemetry["strategy_source"] = state.last_strategy_source
                     telemetry["strategy_age_sec"] = strategy_age if strategy_age != float("inf") else 999.0
-                    telemetry["strategy_degraded"] = state.last_strategy_source != "vlm"
+                    telemetry["strategy_mode"] = state.strategy_mode
+                    telemetry["strategy_degraded"] = state.strategy_degraded_level > 0
+                    telemetry["strategy_degraded_level"] = state.strategy_degraded_level
+                    telemetry["semantic_confidence"] = state.semantic_confidence
 
                     vlm = {
                         "observation": fresh_observation or state.last_scene_observation,
@@ -2000,12 +2160,15 @@ async def explorer_loop() -> None:
                             state.last_thought = _persona_timeout_scan_thought(state.personality_key)
                             state.last_strategy_source = "fallback"
                             state.last_strategy_update_ts = loop.time()
+                            state.semantic_confidence = min(state.semantic_confidence, 0.5)
                         else:
                             state.last_thought = intent.thought
                         actual_action = result.action
                         actual_duration = result.duration_ms
                         plan_speed = plan.speed_level
                         plan_reason = plan.reason
+
+                    _update_strategy_mode(loop.time())
 
                     if result.safety:
                         state.hard_stop_count += 1
@@ -2055,6 +2218,9 @@ async def explorer_loop() -> None:
                         "safety": result.safety,
                         "nav_state": state.last_nav_state,
                         "strategy_source": state.last_strategy_source,
+                        "strategy_mode": state.strategy_mode,
+                        "strategy_degraded_level": state.strategy_degraded_level,
+                        "semantic_confidence": round(state.semantic_confidence, 2),
                         "scene_frontier": intent.frontier,
                         "scene_traversability": intent.traversability,
                         "scene_novelty": intent.novelty,
@@ -2083,6 +2249,9 @@ async def explorer_loop() -> None:
                             "cycle": state.cycle_count,
                             "safety": result.safety,
                             "nav_state": state.last_nav_state,
+                            "strategy_mode": state.strategy_mode,
+                            "strategy_degraded_level": state.strategy_degraded_level,
+                            "semantic_confidence": round(state.semantic_confidence, 2),
                             "command_id": state.last_command_id,
                             "command_source": state.last_command_source,
                             "command_mode": state.last_command_mode,
@@ -2095,7 +2264,7 @@ async def explorer_loop() -> None:
                     )
 
                     log.info(
-                        "🧭 cycle=%d nav=%s action=%s dur=%dms lease=%s dist=%.1fcm motion=%.2f streak=%d rec_lvl=%d rec_cd=%d spd=%s src=%s cmd=%s/%s/%s scene(f=%s t=%s n=%s h=%s) visual=%s side(L=%.2f R=%.2f) light=%s safety=%s objective='%.64s'",
+                        "🧭 cycle=%d nav=%s action=%s dur=%dms lease=%s dist=%.1fcm motion=%.2f streak=%d rec_lvl=%d rec_cd=%d spd=%s src=%s mode=%s lvl=%d conf=%.2f cmd=%s/%s/%s scene(f=%s t=%s n=%s h=%s) visual=%s side(L=%.2f R=%.2f) light=%s safety=%s objective='%.64s'",
                         state.cycle_count,
                         state.last_nav_state,
                         actual_action,
@@ -2108,6 +2277,9 @@ async def explorer_loop() -> None:
                         state.recovery_cooldown_cycles,
                         state.speed_cap_level,
                         state.last_strategy_source,
+                        state.strategy_mode,
+                        state.strategy_degraded_level,
+                        state.semantic_confidence,
                         state.last_command_id,
                         state.last_command_source,
                         state.last_command_mode,
@@ -2228,7 +2400,14 @@ async def health() -> JSONResponse:
             "speed_cap_level": state.speed_cap_level,
             "speed_cap_reason": state.speed_cap_reason,
             "strategy_source": state.last_strategy_source,
+            "strategy_mode": state.strategy_mode,
+            "strategy_degraded_level": state.strategy_degraded_level,
             "strategy_age_sec": round(strategy_age_sec, 2) if strategy_age_sec >= 0 else -1,
+            "semantic_confidence": round(state.semantic_confidence, 2),
+            "semantic_pending_hard": state.semantic_pending_hard,
+            "semantic_pending_blocked": state.semantic_pending_blocked,
+            "vlm_timeout_count": state.vlm_timeout_count,
+            "vlm_disabled_remaining_sec": round(max(0.0, state.vlm_disabled_until_ts - now_ts), 2),
             "last_motion_score": state.last_motion_score,
             "scene_frontier": state.last_scene_frontier,
             "scene_traversability": state.last_scene_traversability,
