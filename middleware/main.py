@@ -56,7 +56,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 WHEELSON_IP = os.getenv("WHEELSON_IP", "192.168.1.100")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SEC", "4.0"))
+LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SEC", "1.2"))
 PORT = int(os.getenv("PORT", "8000"))
 GEMINI_MODEL = "gemini-2.5-flash"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -93,6 +93,8 @@ KLAUS_ARC_INTERVAL = int(os.getenv("KLAUS_ARC_INTERVAL", "3"))
 KLAUS_ARC_TURN_MS = int(os.getenv("KLAUS_ARC_TURN_MS", "760"))
 TIMEOUT_SCAN_STEPS = int(os.getenv("TIMEOUT_SCAN_STEPS", "2"))
 TIMEOUT_SCAN_TURN_MS = int(os.getenv("TIMEOUT_SCAN_TURN_MS", "700"))
+PLAN_LATCH_FORWARD_SEC = float(os.getenv("PLAN_LATCH_FORWARD_SEC", "1.8"))
+PLAN_LATCH_TURN_SEC = float(os.getenv("PLAN_LATCH_TURN_SEC", "0.9"))
 
 TURN_SIDE_MARGIN = 0.08
 SIDE_STEER_RATIO_THRESHOLD = 0.22
@@ -186,18 +188,21 @@ RESPONSE_SCHEMA = (
     "You are a SCENE INTERPRETER, not a motion planner.\n"
     "'observation' must be a SHORT factual description of what the camera shows "
     "(objects/layout/distances/lighting; no personality roleplay).\n"
+    "'commentary' must be ONE short sentence in the active persona voice grounded in this frame. "
+    "Do not include motor commands.\n"
     "Set 'frontier' to one of: forward, left, right, blocked, unknown.\n"
     "Set 'traversability' to one of: low, medium, high.\n"
     "Set 'novelty' to one of: low, medium, high (how interesting/new the scene appears).\n"
     "Set 'hazard' to one of: none, soft, hard.\n"
     "Set 'headlight' to true if additional light would improve scene visibility.\n"
     '{"observation":"A narrow hallway with clear floor and open space ahead.",'
+    '"commentary":"Safety bulletin: clear lane ahead; continuing controlled sweep.",'
     '"frontier":"forward","traversability":"high","novelty":"medium","hazard":"none","headlight":false}'
 )
 SCENE_INTERPRETER_PROMPT = (
     "You are the perception layer for a mobile robot. "
     "Your job is to describe the scene and estimate navigability signals only. "
-    "Do not roleplay a persona and do not output motor actions."
+    "Do not roleplay in the observation field and do not output motor actions."
 )
 
 PERSONA_POLICIES: dict[str, dict] = {
@@ -243,6 +248,12 @@ PERSONA_SALIENCE: dict[str, str] = {
     "sir_david": "Prioritize visually novel subjects, plants, pets, textures, and interesting light.",
     "klaus": "Prioritize perimeter lines, wall continuity, furniture flow, and circulation constraints.",
     "zog7": "Prioritize exposure vs cover, bright zones, moving silhouettes, and concealment routes.",
+}
+PERSONA_COMMENTARY_STYLE: dict[str, str] = {
+    "benson": "formal safety inspector tone",
+    "sir_david": "hushed documentary narration",
+    "klaus": "wry professional design critique",
+    "zog7": "clipped tactical recon report",
 }
 
 
@@ -331,6 +342,7 @@ class AppState:
     last_scene_novelty: str = "medium"
     last_scene_hazard: str = "none"
     last_scene_observation: str = ""
+    last_vlm_commentary: str = ""
 
     # Command authority telemetry
     last_command_id: str = "boot"
@@ -519,7 +531,13 @@ def _normalize_vlm_json(raw: str) -> str:
 # ---------------------------------------------------------------------------
 def _system_prompt(personality_key: str) -> str:
     salience = PERSONA_SALIENCE.get(personality_key, PERSONA_SALIENCE["benson"])
-    return SCENE_INTERPRETER_PROMPT + f" Salience profile: {salience}" + RESPONSE_SCHEMA
+    style = PERSONA_COMMENTARY_STYLE.get(personality_key, PERSONA_COMMENTARY_STYLE["benson"])
+    return (
+        SCENE_INTERPRETER_PROMPT
+        + f" Salience profile: {salience}"
+        + f" Commentary style: {style}."
+        + RESPONSE_SCHEMA
+    )
 
 
 def _build_prompt(telemetry: dict) -> str:
@@ -543,6 +561,7 @@ def _build_prompt(telemetry: dict) -> str:
     obs_warn = ""
     if telemetry.get("visual_obstacle", False):
         obs_warn = " PRE-EMPTIVE WARNING: visual obstacle telemetry is true near the forward lane."
+    prior_commentary = state.last_vlm_commentary if state.last_vlm_commentary else "none"
 
     return (
         f"{mem_lines}"
@@ -554,8 +573,10 @@ def _build_prompt(telemetry: dict) -> str:
         f" Persona salience hints: {salience}"
         f"{obs_warn}"
         f" Last planner objective: {state.last_objective}."
+        f" Last VLM commentary: {prior_commentary}."
         f" Last action: {state.last_action} (repeated {state.action_streak}x)."
         f"{streak_warning}"
+        " Provide a fresh commentary line; do not repeat the previous commentary verbatim."
         " Reply with ONLY the JSON."
     )
 
@@ -635,6 +656,11 @@ async def ask_vlm(
     observation = str(parsed.get("observation", "")).strip()
     if _is_placeholder_text(observation):
         observation = ""
+    commentary = str(parsed.get("commentary", "")).strip()
+    if _is_placeholder_text(commentary):
+        commentary = ""
+    if len(commentary) > 220:
+        commentary = commentary[:220].rstrip() + "..."
 
     frontier = str(parsed.get("frontier", "")).strip().lower()
     traversability = str(parsed.get("traversability", "")).strip().lower()
@@ -643,6 +669,7 @@ async def ask_vlm(
 
     return {
         "observation": observation,
+        "commentary": commentary,
         "headlight": _as_bool(parsed.get("headlight", False)),
         "frontier": frontier,
         "traversability": traversability,
@@ -734,6 +761,7 @@ def _apply_vlm_semantic_contract(vlm_scene: dict, telemetry: dict) -> tuple[dict
 
     vetted = {
         "observation": str(vlm_scene.get("observation", "")).strip(),
+        "commentary": str(vlm_scene.get("commentary", "")).strip(),
         "headlight": _as_bool(vlm_scene.get("headlight", False)),
         "frontier": frontier,
         "traversability": traversability,
@@ -909,6 +937,7 @@ def _compose_persona_thought(personality_key: str, observation: str, objective: 
 def _local_scene_assessment(telemetry: dict) -> dict:
     return {
         "observation": "",
+        "commentary": "",
         "headlight": telemetry.get("brightness") == "Dark",
         "frontier": _infer_frontier(telemetry),
         "traversability": _infer_traversability(telemetry),
@@ -919,6 +948,9 @@ def _local_scene_assessment(telemetry: dict) -> dict:
 
 def build_strategy_intent(vlm: dict, telemetry: dict, source: str, personality_key: str) -> StrategyIntent:
     observation = str(vlm.get("observation", "")).strip()
+    commentary = str(vlm.get("commentary", "")).strip()
+    if _is_placeholder_text(commentary):
+        commentary = ""
     headlight = _as_bool(vlm.get("headlight", False))
 
     frontier = _normalize_frontier(str(vlm.get("frontier", "")))
@@ -945,7 +977,7 @@ def build_strategy_intent(vlm: dict, telemetry: dict, source: str, personality_k
     )
 
     objective = _compose_objective(personality_key, frontier, traversability, novelty, hazard)
-    thought = _compose_persona_thought(personality_key, observation, objective)
+    thought = commentary if commentary else _compose_persona_thought(personality_key, observation, objective)
 
     return StrategyIntent(
         objective=objective,
@@ -986,6 +1018,8 @@ class IntentPlanner:
         self.klaus_wall_seek_streak = 0
         self.david_turn_bias: Literal["left", "right"] = "left"
         self.zog_freeze_cooldown = 0
+        self._latched_plan: MotionPlan | None = None
+        self._latched_until_ts = 0.0
 
     def set_persona(self, persona: str) -> None:
         self.persona = persona
@@ -1000,6 +1034,8 @@ class IntentPlanner:
         self.klaus_wall_seek_streak = 0
         self.david_turn_bias = "left"
         self.zog_freeze_cooldown = 0
+        self._latched_plan = None
+        self._latched_until_ts = 0.0
 
     def _base_speed(self) -> str:
         return str(self.policy.get("base_speed", "medium"))
@@ -1039,9 +1075,37 @@ class IntentPlanner:
 
         self.last_selected_action = action
 
-    def _forward_ms(self, default_ms: int) -> int:
-        configured = int(self.policy.get("forward_burst_ms", default_ms))
-        return configured if configured > 0 else default_ms
+    def _can_interrupt_latch(self, intent: StrategyIntent, telemetry: dict) -> bool:
+        if bool(telemetry.get("strategy_timeout_event", False)):
+            return True
+        if bool(telemetry.get("visual_obstacle", False)):
+            return True
+        if intent.hazard == "hard" or intent.frontier == "blocked":
+            return True
+        return False
+
+    def _latch_plan(self, plan: MotionPlan, now_ts: float) -> None:
+        hold_for = 0.0
+        if plan.action == "forward" and plan.duration_ms == 0 and plan.mode == "explore":
+            base_ms = int(self.policy.get("forward_burst_ms", FORWARD_BURST_DEFAULT_MS))
+            persona_hold = max(1.0, min(3.0, base_ms / 500.0))
+            hold_for = max(PLAN_LATCH_FORWARD_SEC, persona_hold)
+        elif plan.action in {"left", "right"} and plan.duration_ms > 0:
+            hold_for = PLAN_LATCH_TURN_SEC
+
+        if hold_for <= 0.0:
+            self._latched_plan = None
+            self._latched_until_ts = 0.0
+            return
+
+        self._latched_plan = MotionPlan(
+            action=plan.action,
+            duration_ms=plan.duration_ms,
+            speed_level=plan.speed_level,
+            mode=plan.mode,
+            reason=plan.reason,
+        )
+        self._latched_until_ts = now_ts + hold_for
 
     def _frontier_turn(self, intent: StrategyIntent, telemetry: dict) -> Literal["left", "right"]:
         if intent.frontier == "left":
@@ -1136,7 +1200,6 @@ class IntentPlanner:
         return speed, ",".join(reasons) if reasons else "none"
 
     def _plan_benson(self, intent: StrategyIntent, telemetry: dict, speed_level: str) -> MotionPlan:
-        forward_ms = min(self._forward_ms(700), 750)
         turn_ms = min(TURN_DURATION_MS.get(self.persona, 550), 650)
 
         if intent.hazard == "hard" or intent.frontier == "blocked":
@@ -1147,7 +1210,7 @@ class IntentPlanner:
         if intent.hazard == "soft" or intent.traversability == "low":
             return MotionPlan(self._open_turn(telemetry), turn_ms, "slow", "turn", "benson:risk_turn")
 
-        if self.forward_chain_streak >= 4:
+        if self.forward_chain_streak >= 8:
             return MotionPlan("stop", 0, "slow", "hold", "benson:safety_pause")
 
         if bool(telemetry.get("strategy_degraded", False)) and self.forward_chain_streak >= 2:
@@ -1156,7 +1219,7 @@ class IntentPlanner:
         if intent.frontier in {"left", "right"}:
             return MotionPlan(intent.frontier, turn_ms, speed_level, "turn", "benson:frontier_turn")
 
-        return MotionPlan("forward", forward_ms, speed_level, "explore", "benson:controlled_advance")
+        return MotionPlan("forward", 0, speed_level, "explore", "benson:controlled_advance")
 
     def _next_david_turn(self, hint: Literal["left", "right"] | None = None) -> Literal["left", "right"]:
         if hint in {"left", "right"}:
@@ -1166,7 +1229,6 @@ class IntentPlanner:
         return self.david_turn_bias
 
     def _plan_sir_david(self, intent: StrategyIntent, telemetry: dict, speed_level: str) -> MotionPlan:
-        forward_ms = max(self._forward_ms(900), 900)
         turn_ms = max(TURN_DURATION_MS.get(self.persona, 500), 520)
 
         if intent.hazard == "hard":
@@ -1178,7 +1240,7 @@ class IntentPlanner:
         if intent.novelty == "high" and intent.hazard == "none":
             if self.forward_chain_streak >= 2:
                 return MotionPlan(self._next_david_turn(), turn_ms, speed_level, "turn", "sirdavid:reframe_subject")
-            return MotionPlan("forward", forward_ms + 200, speed_level, "explore", "sirdavid:approach_novelty")
+            return MotionPlan("forward", 0, speed_level, "explore", "sirdavid:approach_novelty")
 
         if self.forward_chain_streak >= 3:
             hint = intent.frontier if intent.frontier in {"left", "right"} else None
@@ -1187,7 +1249,7 @@ class IntentPlanner:
         if intent.frontier in {"left", "right"} and intent.hazard != "soft":
             return MotionPlan(intent.frontier, turn_ms, speed_level, "turn", "sirdavid:follow_frontier")
 
-        return MotionPlan("forward", forward_ms, speed_level, "explore", "sirdavid:gentle_explore")
+        return MotionPlan("forward", 0, speed_level, "explore", "sirdavid:gentle_explore")
 
     def _plan_klaus(self, intent: StrategyIntent, telemetry: dict, speed_level: str, cycle_count: int) -> MotionPlan:
         preferred = str(self.policy.get("preferred_wall", "left"))
@@ -1206,7 +1268,7 @@ class IntentPlanner:
         if wall_signal < 0.08:
             self.klaus_wall_seek_streak += 1
             if self.klaus_wall_seek_streak % 2 == 0:
-                return MotionPlan("forward", 600, speed_level, "explore", "klaus:probe_perimeter")
+                return MotionPlan("forward", 0, speed_level, "explore", "klaus:probe_perimeter")
             return MotionPlan(preferred_turn, wide_turn_ms, speed_level, "turn", "klaus:acquire_perimeter")
         self.klaus_wall_seek_streak = 0
 
@@ -1222,7 +1284,7 @@ class IntentPlanner:
         if bool(telemetry.get("strategy_degraded", False)) and self.forward_chain_streak >= 1:
             return MotionPlan(preferred_turn, wide_turn_ms, "slow", "turn", "klaus:scan_perimeter")
 
-        return MotionPlan("forward", self._forward_ms(850), speed_level, "explore", "klaus:perimeter_sweep")
+        return MotionPlan("forward", 0, speed_level, "explore", "klaus:perimeter_sweep")
 
     def _plan_zog7(self, intent: StrategyIntent, telemetry: dict, speed_level: str) -> MotionPlan:
         preferred = str(self.policy.get("preferred_wall", "right"))
@@ -1254,13 +1316,29 @@ class IntentPlanner:
         if self.forward_chain_streak >= 3:
             return MotionPlan("stop", 0, "slow", "hold", "zog7:listen_pause")
 
-        return MotionPlan("forward", min(self._forward_ms(650), 720), speed_level, "explore", "zog7:shadow_run")
+        return MotionPlan("forward", 0, speed_level, "explore", "zog7:shadow_run")
 
-    def plan(self, intent: StrategyIntent, telemetry: dict, cycle_count: int) -> MotionPlan:
+    def plan(self, intent: StrategyIntent, telemetry: dict, cycle_count: int, now_ts: float) -> MotionPlan:
+        if (
+            self._latched_plan
+            and now_ts < self._latched_until_ts
+            and not self._can_interrupt_latch(intent, telemetry)
+        ):
+            self._register_action(self._latched_plan.action)
+            return MotionPlan(
+                action=self._latched_plan.action,
+                duration_ms=self._latched_plan.duration_ms,
+                speed_level=self._latched_plan.speed_level,
+                mode=self._latched_plan.mode,
+                reason=f"{self._latched_plan.reason}|latched",
+            )
+
         base_speed = self._base_speed()
         speed_level, speed_reason = self._scene_speed(base_speed, intent, telemetry, cycle_count)
         timeout_plan = self._strategy_timeout_plan(speed_level, telemetry)
         if timeout_plan:
+            self._latched_plan = None
+            self._latched_until_ts = 0.0
             self._register_action(timeout_plan.action)
             timeout_plan.reason = f"{timeout_plan.reason}|{speed_reason}"
             return timeout_plan
@@ -1274,9 +1352,10 @@ class IntentPlanner:
         elif self.persona == "zog7":
             plan = self._plan_zog7(intent, telemetry, speed_level)
         else:
-            plan = MotionPlan("forward", self._forward_ms(800), speed_level, "explore", "default:advance")
+            plan = MotionPlan("forward", 0, speed_level, "explore", "default:advance")
 
         self._register_action(plan.action)
+        self._latch_plan(plan, now_ts)
         plan.reason = f"{plan.reason}|{speed_reason}"
         return plan
 
@@ -1833,6 +1912,7 @@ async def explorer_loop() -> None:
     state.last_scene_novelty = bootstrap_intent.novelty
     state.last_scene_hazard = bootstrap_intent.hazard
     state.last_scene_observation = bootstrap_intent.observation
+    state.last_vlm_commentary = bootstrap_intent.thought
 
     loop = asyncio.get_running_loop()
     state.last_strategy_source = "bootstrap"
@@ -1975,6 +2055,9 @@ async def explorer_loop() -> None:
                             state.last_scene_novelty = str(vetted_scene.get("novelty", "medium"))
                             state.last_scene_hazard = str(vetted_scene.get("hazard", "none"))
                             state.last_scene_observation = str(vetted_scene.get("observation", ""))
+                            incoming_commentary = str(vetted_scene.get("commentary", "")).strip()
+                            if incoming_commentary:
+                                state.last_vlm_commentary = incoming_commentary
                             state.semantic_confidence = semantic_conf
                             state.last_strategy_source = "vlm"
                             state.last_strategy_update_ts = now_ts
@@ -2099,6 +2182,7 @@ async def explorer_loop() -> None:
 
                     vlm = {
                         "observation": fresh_observation or state.last_scene_observation,
+                        "commentary": state.last_vlm_commentary,
                         "headlight": state.last_vlm_headlight_pref,
                         "frontier": state.last_scene_frontier,
                         "traversability": state.last_scene_traversability,
@@ -2152,7 +2236,7 @@ async def explorer_loop() -> None:
                         plan_speed = "medium"
                         plan_reason = f"recovery:{trigger.level}"
                     else:
-                        plan = planner.plan(intent, telemetry, state.cycle_count)
+                        plan = planner.plan(intent, telemetry, state.cycle_count, now_ts)
                         fallback_plan = plan.reason.startswith("gate:strategist_timeout")
                         source = "strategist_fallback" if fallback_plan else intent.source
                         result = await motion.apply_plan(plan, source=source)

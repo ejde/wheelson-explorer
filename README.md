@@ -21,6 +21,7 @@ Control is layered by priority. Higher-priority layers can suppress lower-priori
 - Single writer to `/move` (`MotionSupervisor`)
 - Heartbeat renewal for continuous motion commands
 - Command metadata propagation (`command_id`, `source`, `mode`)
+- Smooth-control cadence: continuous forward lease with short latched plans to avoid action thrash
 
 3. **S2 Recovery FSM (middleware)**
 - Deterministic nudge/escape/hard-escape escalation
@@ -31,7 +32,7 @@ Control is layered by priority. Higher-priority layers can suppress lower-priori
 - Distinct policies for `benson`, `sir_david`, `klaus`, `zog7`
 
 5. **S4 Semantic Interpreter (VLM, async advisory)**
-- VLM outputs **scene semantics only** (`frontier`, `traversability`, `novelty`, `hazard`, `headlight`, `observation`)
+- VLM outputs scene semantics (`frontier`, `traversability`, `novelty`, `hazard`, `headlight`, `observation`) plus persona commentary text (`commentary`)
 - No direct motor commands from VLM
 
 ### Control/Dataflow Diagram
@@ -60,6 +61,7 @@ flowchart TD
 The VLM is intentionally non-blocking and non-authoritative for motion.
 
 - **Async only**: planner continues without waiting for VLM completion.
+- **Thought cadence**: persona commentary updates on VLM refresh cadence, then persists between refreshes.
 - **Semantic TTL**: stale VLM semantics expire (`SEMANTIC_TTL_SEC`).
 - **Confirmation gates**: risky one-frame labels (`hard`, `blocked`) require confirmation across frames.
 - **Timeout escalation**:
@@ -202,7 +204,7 @@ cp .env.example .env
 ```env
 WHEELSON_IP=192.168.1.112
 GEMINI_API_KEY=...
-LOOP_INTERVAL_SEC=4.0
+LOOP_INTERVAL_SEC=1.2
 PORT=8000
 OLLAMA_BASE_URL=http://localhost:11434
 ```
@@ -232,6 +234,8 @@ KLAUS_ARC_INTERVAL=3
 KLAUS_ARC_TURN_MS=760
 TIMEOUT_SCAN_STEPS=2
 TIMEOUT_SCAN_TURN_MS=700
+PLAN_LATCH_FORWARD_SEC=1.8
+PLAN_LATCH_TURN_SEC=0.9
 ```
 
 ### Run
