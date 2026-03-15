@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -35,6 +36,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 from PIL import Image
 
 load_dotenv()
@@ -95,6 +97,9 @@ TIMEOUT_SCAN_STEPS = int(os.getenv("TIMEOUT_SCAN_STEPS", "2"))
 TIMEOUT_SCAN_TURN_MS = int(os.getenv("TIMEOUT_SCAN_TURN_MS", "700"))
 PLAN_LATCH_FORWARD_SEC = float(os.getenv("PLAN_LATCH_FORWARD_SEC", "1.8"))
 PLAN_LATCH_TURN_SEC = float(os.getenv("PLAN_LATCH_TURN_SEC", "0.9"))
+
+CONTROL_BUDGET_SEC = float(os.getenv("CONTROL_BUDGET_SEC", "60.0"))
+CONTROL_INACTIVITY_SEC = float(os.getenv("CONTROL_INACTIVITY_SEC", "3.0"))
 
 TURN_SIDE_MARGIN = 0.08
 SIDE_STEER_RATIO_THRESHOLD = 0.22
@@ -263,6 +268,14 @@ class VLMResponseError(Exception):
         self.raw = raw
 
 
+@dataclass
+class ControlSession:
+    token: str
+    name: str
+    joined_at: float
+    last_command_at: float = 0.0
+
+
 def _exc_summary(exc: Exception, max_len: int = 180) -> str:
     text = str(exc).replace("\n", " ").strip()
     if not text:
@@ -361,10 +374,24 @@ class AppState:
     event_log: list = field(default_factory=list)
     is_running: bool = False
 
+    # Remote control / queue state
+    remote_controller_name: str = ""
+    remote_control_remaining_s: float = 0.0
+    remote_queue_length: int = 0
+    remote_is_active: bool = False
+
+    # Pending persona switch (set by HTTP handler, consumed by loop)
+    pending_persona: str = ""
+
 
 state = AppState()
 app = FastAPI(title="Wheelson Explorer", docs_url=None, redoc_url=None)
 _sse_subscribers: set[asyncio.Queue] = set()
+
+# Remote control state (shared between HTTP handlers and explorer_loop)
+_control_queue: list[ControlSession] = []
+_queue_lock = asyncio.Lock()
+_motion_supervisor: "MotionSupervisor | None" = None
 
 
 def broadcast(event: dict) -> None:
@@ -1747,6 +1774,14 @@ class MotionSupervisor:
         async with self._lock:
             return await self._post_stop_locked(source=source, mode=mode)
 
+    async def remote_move(self, direction: str, duration_ms: int = 600) -> MotionResult:
+        """Execute a single remote-control command. Called directly by HTTP handler."""
+        async with self._lock:
+            await self._ensure_speed_locked(level="medium", source="remote", mode="manual")
+            if direction == "stop":
+                return await self._post_stop_locked(source="remote", mode="manual")
+            return await self._post_timed_locked(direction, duration_ms, source="remote", mode="manual")
+
     async def _heartbeat_loop(self) -> None:
         while self._running:
             await asyncio.sleep(LEASE_HEARTBEAT_SEC)
@@ -1947,6 +1982,11 @@ async def explorer_loop() -> None:
 
         await motion.start()
 
+        global _motion_supervisor
+        _motion_supervisor = motion
+
+        _remote_was_active = False
+
         last_vlm_request_ts = 0.0
         vlm_backoff_until_ts = 0.0
         vlm_task: asyncio.Task | None = None
@@ -2039,6 +2079,42 @@ async def explorer_loop() -> None:
                     telemetry["motion_score"] = motion_score
 
                     now_ts = loop.time()
+
+                    # ── Persona switch (requested via HTTP) ──────────────────
+                    if state.pending_persona and state.pending_persona in PERSONALITIES:
+                        _new_persona = state.pending_persona
+                        state.pending_persona = ""
+                        state.personality_key = _new_persona
+                        planner.set_persona(_new_persona)
+                        system = _system_prompt(_new_persona)
+                        personality = PERSONALITIES[_new_persona]
+                        log.info(
+                            "🎭 [PERSONA] Switched to %s %s",
+                            personality["emoji"],
+                            personality["name"],
+                        )
+
+                    # ── Control queue advancement ────────────────────────────
+                    async with _queue_lock:
+                        while _control_queue and (now_ts - _control_queue[0].joined_at) > CONTROL_BUDGET_SEC:
+                            expired_sess = _control_queue.pop(0)
+                            log.info("🎮 [REMOTE] Session expired for '%s'", expired_sess.name)
+                        state.remote_queue_length = len(_control_queue)
+                        if _control_queue:
+                            _head = _control_queue[0]
+                            state.remote_controller_name = _head.name
+                            state.remote_control_remaining_s = max(
+                                0.0, CONTROL_BUDGET_SEC - (now_ts - _head.joined_at)
+                            )
+                            state.remote_is_active = (
+                                _head.last_command_at > 0
+                                and (now_ts - _head.last_command_at) < CONTROL_INACTIVITY_SEC
+                            )
+                        else:
+                            state.remote_controller_name = ""
+                            state.remote_control_remaining_s = 0.0
+                            state.remote_is_active = False
+
                     fresh_observation = ""
                     strategy_timeout_event = False
                     timeout_scan_steps = TIMEOUT_SCAN_STEPS
@@ -2205,52 +2281,82 @@ async def explorer_loop() -> None:
                         await motion.sync_headlight(desired_headlight, source="planner")
                         state.last_headlight = desired_headlight
 
-                    trigger: RecoveryTrigger | None = None
-                    if not strategy_timeout_event:
-                        tracking_forward = (
-                            state.last_action == "forward"
-                            or motion.active_continuous_action == "forward"
+                    # ── S5: Human Override ───────────────────────────────────
+                    # Remote control takes priority over all planner/recovery logic.
+                    # VLM, scene analysis, and persona thoughts keep running normally.
+                    if state.remote_is_active:
+                        if not _remote_was_active:
+                            # Transition: halt any ongoing autonomous motion
+                            await motion.stop_now(source="remote", mode="manual")
+                            recovery.reset()
+                            _remote_was_active = True
+                            log.info("🎮 [REMOTE] %s took control", state.remote_controller_name)
+                        # Keep displaying the last autonomous thought while human drives
+                        result = MotionResult(
+                            action=state.last_action,
+                            duration_ms=0,
+                            safety=False,
+                            busy=False,
+                            command_id=state.last_command_id,
+                            source="remote",
+                            mode="manual",
                         )
-                        trigger = recovery.observe(
-                            tracking_forward=tracking_forward,
-                            motion_score=motion_score,
-                            telemetry=telemetry,
-                        )
-
-                    plan_speed = "medium"
-                    plan_reason = "recovery"
-
-                    if trigger:
-                        reactive_thought = _persona_reactive_thought(state.personality_key, trigger.level)
-                        result = await motion.execute_recovery(
-                            level=trigger.level,
-                            turn_direction=trigger.turn_direction,
-                            speed_level="medium",
-                            source="reactive",
-                        )
-                        state.last_thought = reactive_thought
-                        state.last_strategy_source = "reactive"
-                        state.last_strategy_update_ts = loop.time()
-                        actual_action = result.action
-                        actual_duration = result.duration_ms
-                        plan_speed = "medium"
-                        plan_reason = f"recovery:{trigger.level}"
+                        actual_action = state.last_action
+                        actual_duration = 0
+                        plan_speed = "remote"
+                        plan_reason = "remote_override"
                     else:
-                        plan = planner.plan(intent, telemetry, state.cycle_count, now_ts)
-                        fallback_plan = plan.reason.startswith("gate:strategist_timeout")
-                        source = "strategist_fallback" if fallback_plan else intent.source
-                        result = await motion.apply_plan(plan, source=source)
-                        if fallback_plan:
-                            state.last_thought = _persona_timeout_scan_thought(state.personality_key)
-                            state.last_strategy_source = "fallback"
+                        # ── S2–S3: Recovery FSM / Autonomous Planner ─────────
+                        if _remote_was_active:
+                            _remote_was_active = False
+                            log.info("🤖 [REMOTE] Autonomy resumed after '%s'", state.remote_controller_name)
+
+                        trigger: RecoveryTrigger | None = None
+                        if not strategy_timeout_event:
+                            tracking_forward = (
+                                state.last_action == "forward"
+                                or motion.active_continuous_action == "forward"
+                            )
+                            trigger = recovery.observe(
+                                tracking_forward=tracking_forward,
+                                motion_score=motion_score,
+                                telemetry=telemetry,
+                            )
+
+                        plan_speed = "medium"
+                        plan_reason = "recovery"
+
+                        if trigger:
+                            reactive_thought = _persona_reactive_thought(state.personality_key, trigger.level)
+                            result = await motion.execute_recovery(
+                                level=trigger.level,
+                                turn_direction=trigger.turn_direction,
+                                speed_level="medium",
+                                source="reactive",
+                            )
+                            state.last_thought = reactive_thought
+                            state.last_strategy_source = "reactive"
                             state.last_strategy_update_ts = loop.time()
-                            state.semantic_confidence = min(state.semantic_confidence, 0.5)
+                            actual_action = result.action
+                            actual_duration = result.duration_ms
+                            plan_speed = "medium"
+                            plan_reason = f"recovery:{trigger.level}"
                         else:
-                            state.last_thought = intent.thought
-                        actual_action = result.action
-                        actual_duration = result.duration_ms
-                        plan_speed = plan.speed_level
-                        plan_reason = plan.reason
+                            plan = planner.plan(intent, telemetry, state.cycle_count, now_ts)
+                            fallback_plan = plan.reason.startswith("gate:strategist_timeout")
+                            source = "strategist_fallback" if fallback_plan else intent.source
+                            result = await motion.apply_plan(plan, source=source)
+                            if fallback_plan:
+                                state.last_thought = _persona_timeout_scan_thought(state.personality_key)
+                                state.last_strategy_source = "fallback"
+                                state.last_strategy_update_ts = loop.time()
+                                state.semantic_confidence = min(state.semantic_confidence, 0.5)
+                            else:
+                                state.last_thought = intent.thought
+                            actual_action = result.action
+                            actual_duration = result.duration_ms
+                            plan_speed = plan.speed_level
+                            plan_reason = plan.reason
 
                     _update_strategy_mode(loop.time())
 
@@ -2343,6 +2449,10 @@ async def explorer_loop() -> None:
                             "scene_traversability": intent.traversability,
                             "scene_novelty": intent.novelty,
                             "scene_hazard": intent.hazard,
+                            "remote_controller": state.remote_controller_name,
+                            "remote_queue_length": state.remote_queue_length,
+                            "remote_remaining_s": round(state.remote_control_remaining_s, 1),
+                            "remote_is_active": state.remote_is_active,
                             "ts": entry["ts"],
                         }
                     )
@@ -2400,6 +2510,23 @@ async def explorer_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+class JoinQueueRequest(BaseModel):
+    name: str
+
+class LeaveQueueRequest(BaseModel):
+    token: str
+
+class RemoteControlRequest(BaseModel):
+    token: str
+    direction: str
+
+class PersonaRequest(BaseModel):
+    persona: str
+
+
+# ---------------------------------------------------------------------------
 # FastAPI routes
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
@@ -2447,6 +2574,80 @@ async def sse_stream() -> StreamingResponse:
             "Connection": "keep-alive",
         },
     )
+
+
+@app.post("/queue/join")
+async def queue_join(req: JoinQueueRequest) -> JSONResponse:
+    name = req.name.strip()[:32]
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    token = secrets.token_urlsafe(16)
+    async with _queue_lock:
+        now = asyncio.get_event_loop().time()
+        # Don't allow the same name to join twice
+        if any(s.name == name for s in _control_queue):
+            return JSONResponse({"error": "already_in_queue"}, status_code=409)
+        session = ControlSession(token=token, name=name, joined_at=now)
+        _control_queue.append(session)
+        position = len(_control_queue)
+    log.info("🎮 [REMOTE] '%s' joined queue at position %d", name, position)
+    return JSONResponse({
+        "token": token,
+        "position": position,
+        "budget_sec": CONTROL_BUDGET_SEC,
+    })
+
+
+@app.post("/queue/leave")
+async def queue_leave(req: LeaveQueueRequest) -> JSONResponse:
+    async with _queue_lock:
+        before = len(_control_queue)
+        _control_queue[:] = [s for s in _control_queue if s.token != req.token]
+        removed = before - len(_control_queue)
+    return JSONResponse({"ok": True, "removed": removed})
+
+
+@app.post("/control")
+async def remote_control(req: RemoteControlRequest) -> JSONResponse:
+    if not _control_queue or _control_queue[0].token != req.token:
+        return JSONResponse({"error": "not_your_turn"}, status_code=403)
+    session = _control_queue[0]
+    now = asyncio.get_event_loop().time()
+    if (now - session.joined_at) > CONTROL_BUDGET_SEC:
+        return JSONResponse({"error": "session_expired"}, status_code=403)
+    direction = req.direction
+    if direction not in ALL_ACTIONS:
+        return JSONResponse({"error": "invalid_direction"}, status_code=400)
+    session.last_command_at = now
+    if _motion_supervisor is None:
+        return JSONResponse({"error": "not_ready"}, status_code=503)
+    await _motion_supervisor.remote_move(direction)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/persona")
+async def switch_persona(req: PersonaRequest) -> JSONResponse:
+    if req.persona not in PERSONALITIES:
+        return JSONResponse({"error": "invalid_persona", "valid": list(PERSONALITIES.keys())}, status_code=400)
+    state.pending_persona = req.persona
+    p = PERSONALITIES[req.persona]
+    log.info("🎭 [PERSONA] Switch requested -> %s %s", p["emoji"], p["name"])
+    return JSONResponse({"ok": True, "persona": req.persona})
+
+
+@app.get("/queue/status")
+async def queue_status() -> JSONResponse:
+    async with _queue_lock:
+        now = asyncio.get_event_loop().time()
+        entries = [
+            {
+                "name": s.name,
+                "position": i + 1,
+                "remaining_s": round(max(0.0, CONTROL_BUDGET_SEC - (now - s.joined_at)), 1),
+            }
+            for i, s in enumerate(_control_queue)
+        ]
+    return JSONResponse({"queue": entries, "budget_sec": CONTROL_BUDGET_SEC})
 
 
 @app.get("/snapshot")

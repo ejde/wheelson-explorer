@@ -153,7 +153,6 @@
       position: absolute;
       inset: 0;
       pointer-events: none;
-      /* Corner brackets */
       background:
         linear-gradient(var(--glow), var(--glow)) top 16px left 16px / 24px 2px no-repeat,
         linear-gradient(var(--glow), var(--glow)) top 16px left 16px / 2px 24px no-repeat,
@@ -194,6 +193,75 @@
       margin-bottom: 12px;
     }
 
+    /* ── D-Pad Overlay ────────────────────────────────────────────── */
+    #dpad-overlay {
+      position: absolute;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      z-index: 10;
+      user-select: none;
+    }
+
+    #dpad-overlay.visible { display: flex; }
+
+    .dpad-row {
+      display: flex;
+      gap: 4px;
+    }
+
+    .dpad-btn {
+      width: 52px;
+      height: 52px;
+      background: rgba(0, 0, 0, .72);
+      border: 1px solid var(--glow-mid);
+      border-radius: 8px;
+      color: var(--glow);
+      font-size: 20px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background .1s, box-shadow .1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .dpad-btn:active,
+    .dpad-btn.pressed {
+      background: rgba(0, 255, 213, .22);
+      box-shadow: 0 0 14px var(--glow);
+    }
+
+    .dpad-center {
+      background: rgba(239, 68, 68, .18);
+      border-color: rgba(239, 68, 68, .5);
+      color: var(--red);
+      font-size: 14px;
+      letter-spacing: 1px;
+    }
+
+    /* control status banner on camera */
+    #control-banner {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 5px 12px;
+      border-radius: 5px;
+      background: rgba(0, 0, 0, .7);
+      border: 1px solid var(--glow-mid);
+      color: var(--glow);
+      letter-spacing: 1px;
+      display: none;
+    }
+
+    #control-banner.visible { display: block; }
+
     /* ── Right Sidebar ────────────────────────────────────────────── */
     .sidebar {
       display: flex;
@@ -203,7 +271,7 @@
 
     /* ── Personality Card ─────────────────────────────────────────── */
     .personality-card {
-      padding: 16px 18px;
+      padding: 14px 18px;
       background: var(--bg2);
       border-bottom: 1px solid var(--border);
     }
@@ -225,9 +293,7 @@
       gap: 10px;
     }
 
-    .personality-name .emoji {
-      font-size: 22px;
-    }
+    .personality-name .emoji { font-size: 22px; }
 
     .personality-name .name-text {
       text-shadow: 0 0 20px var(--p-color, var(--glow));
@@ -235,15 +301,50 @@
     }
 
     .personality-bias {
-      margin-top: 6px;
+      margin-top: 4px;
       font-size: 11px;
       color: var(--text-dim);
       font-style: italic;
     }
 
+    /* ── Persona Switcher ─────────────────────────────────────────── */
+    .persona-switcher {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .persona-btn {
+      flex: 1;
+      padding: 5px 4px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-dim);
+      font-family: var(--mono);
+      font-size: 10px;
+      cursor: pointer;
+      text-align: center;
+      transition: all .2s;
+      letter-spacing: .5px;
+    }
+
+    .persona-btn:hover {
+      border-color: var(--p-btn-color, var(--glow));
+      color: var(--p-btn-color, var(--glow));
+      background: rgba(255,255,255,.04);
+    }
+
+    .persona-btn.active {
+      border-color: var(--p-btn-color, var(--glow));
+      color: var(--p-btn-color, var(--glow));
+      background: rgba(255,255,255,.07);
+      box-shadow: 0 0 8px color-mix(in srgb, var(--p-btn-color, var(--glow)) 30%, transparent);
+    }
+
     /* ── Thought Bubble ───────────────────────────────────────────── */
     .thought-section {
-      padding: 14px 18px;
+      padding: 12px 18px;
       background: var(--bg3);
       border-bottom: 1px solid var(--border);
     }
@@ -286,15 +387,8 @@
     }
 
     @keyframes blink {
-
-      0%,
-      100% {
-        opacity: 1
-      }
-
-      50% {
-        opacity: 0
-      }
+      0%, 100% { opacity: 1 }
+      50% { opacity: 0 }
     }
 
     /* ── Action / Distance Row ────────────────────────────────────── */
@@ -320,51 +414,17 @@
       white-space: nowrap;
     }
 
-    .action-forward {
-      background: rgba(34, 197, 94, .15);
-      color: var(--green);
-      border-color: var(--green);
-      box-shadow: 0 0 12px rgba(34, 197, 94, .3);
-    }
-
-    .action-backward {
-      background: rgba(249, 115, 22, .15);
-      color: var(--orange);
-      border-color: var(--orange);
-      box-shadow: 0 0 12px rgba(249, 115, 22, .3);
-    }
-
+    .action-forward  { background: rgba(34,197,94,.15); color: var(--green); border-color: var(--green); box-shadow: 0 0 12px rgba(34,197,94,.3); }
+    .action-backward { background: rgba(249,115,22,.15); color: var(--orange); border-color: var(--orange); box-shadow: 0 0 12px rgba(249,115,22,.3); }
     .action-left,
-    .action-right {
-      background: rgba(245, 158, 11, .15);
-      color: var(--yellow);
-      border-color: var(--yellow);
-      box-shadow: 0 0 12px rgba(245, 158, 11, .3);
-    }
+    .action-right    { background: rgba(245,158,11,.15); color: var(--yellow); border-color: var(--yellow); box-shadow: 0 0 12px rgba(245,158,11,.3); }
+    .action-stop     { background: rgba(239,68,68,.15); color: var(--red); border-color: var(--red); box-shadow: 0 0 12px rgba(239,68,68,.3); }
 
-    .action-stop {
-      background: rgba(239, 68, 68, .15);
-      color: var(--red);
-      border-color: var(--red);
-      box-shadow: 0 0 12px rgba(239, 68, 68, .3);
-    }
-
-    /* Safety flash */
     @keyframes safety-flash {
-
-      0%,
-      100% {
-        background: rgba(239, 68, 68, .15);
-      }
-
-      50% {
-        background: rgba(239, 68, 68, .5);
-      }
+      0%, 100% { background: rgba(239,68,68,.15); }
+      50%       { background: rgba(239,68,68,.5); }
     }
-
-    .safety-active {
-      animation: safety-flash .4s ease 3;
-    }
+    .safety-active { animation: safety-flash .4s ease 3; }
 
     .dist-widget {
       flex: 1;
@@ -382,14 +442,10 @@
       justify-content: space-between;
     }
 
-    #dist-value {
-      transition: color .3s;
-    }
-
     .dist-bar-bg {
       width: 100%;
       height: 6px;
-      background: rgba(255, 255, 255, .06);
+      background: rgba(255,255,255,.06);
       border-radius: 3px;
       overflow: hidden;
     }
@@ -401,6 +457,112 @@
       box-shadow: 0 0 6px var(--glow);
       transition: width .4s ease, background .3s;
       width: 100%;
+    }
+
+    /* ── Control / Queue Panel ────────────────────────────────────── */
+    .control-section {
+      padding: 12px 18px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .control-section .label {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+      margin-bottom: 10px;
+    }
+
+    /* Join form */
+    #join-form {
+      display: flex;
+      gap: 6px;
+    }
+
+    #join-name {
+      flex: 1;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text-bright);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 6px 10px;
+      outline: none;
+      transition: border-color .2s;
+    }
+
+    #join-name:focus { border-color: var(--glow-mid); }
+
+    #join-btn, #leave-btn {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--glow-mid);
+      background: var(--glow-dim);
+      color: var(--glow);
+      cursor: pointer;
+      transition: all .2s;
+      letter-spacing: 1px;
+      white-space: nowrap;
+    }
+
+    #join-btn:hover { background: rgba(0,255,213,.2); }
+
+    #leave-btn {
+      border-color: rgba(239,68,68,.4);
+      background: rgba(239,68,68,.1);
+      color: var(--red);
+      display: none;
+    }
+
+    #leave-btn:hover { background: rgba(239,68,68,.2); }
+
+    /* Queue status */
+    #queue-status {
+      margin-top: 8px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      min-height: 20px;
+    }
+
+    #queue-status .qs-controller {
+      color: var(--green);
+      font-weight: 600;
+    }
+
+    #queue-status .qs-you {
+      color: var(--glow);
+    }
+
+    #queue-status .qs-waiting {
+      color: var(--yellow);
+    }
+
+    /* Timer bar */
+    #timer-bar-wrap {
+      margin-top: 6px;
+      display: none;
+    }
+
+    #timer-bar-wrap.visible { display: block; }
+
+    .timer-bar-bg {
+      width: 100%;
+      height: 4px;
+      background: rgba(255,255,255,.06);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    #timer-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      background: var(--green);
+      transition: width .5s linear, background .3s;
     }
 
     /* ── Event Log ────────────────────────────────────────────────── */
@@ -430,31 +592,18 @@
       scrollbar-color: var(--border) transparent;
     }
 
-    #event-log::-webkit-scrollbar {
-      width: 4px;
-    }
-
-    #event-log::-webkit-scrollbar-thumb {
-      background: var(--border);
-      border-radius: 2px;
-    }
+    #event-log::-webkit-scrollbar { width: 4px; }
+    #event-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
     .log-entry {
       padding: 8px 18px;
-      border-bottom: 1px solid rgba(255, 255, 255, .03);
+      border-bottom: 1px solid rgba(255,255,255,.03);
       animation: fadeIn .3s ease;
     }
 
     @keyframes fadeIn {
-      from {
-        opacity: 0;
-        transform: translateY(-4px)
-      }
-
-      to {
-        opacity: 1;
-        transform: translateY(0)
-      }
+      from { opacity: 0; transform: translateY(-4px) }
+      to   { opacity: 1; transform: translateY(0) }
     }
 
     .log-meta {
@@ -472,25 +621,11 @@
       letter-spacing: 1px;
     }
 
-    .log-entry.forward .log-action-tag {
-      color: var(--green);
-    }
-
-    .log-entry.backward .log-action-tag {
-      color: var(--orange);
-    }
-
-    .log-entry.left,
-    .log-entry.right {}
-
-    .log-entry.left .log-action-tag,
-    .log-entry.right .log-action-tag {
-      color: var(--yellow);
-    }
-
-    .log-entry.stop .log-action-tag {
-      color: var(--red);
-    }
+    .log-entry.forward  .log-action-tag { color: var(--green); }
+    .log-entry.backward .log-action-tag { color: var(--orange); }
+    .log-entry.left     .log-action-tag,
+    .log-entry.right    .log-action-tag { color: var(--yellow); }
+    .log-entry.stop     .log-action-tag { color: var(--red); }
 
     .log-thought {
       font-size: 12px;
@@ -501,12 +636,25 @@
 
     .safety-tag {
       display: inline-block;
-      background: rgba(239, 68, 68, .2);
+      background: rgba(239,68,68,.2);
       color: var(--red);
       font-size: 9px;
       padding: 1px 6px;
       border-radius: 3px;
       border: 1px solid var(--red);
+      font-family: var(--mono);
+      margin-left: 4px;
+      letter-spacing: 1px;
+    }
+
+    .remote-tag {
+      display: inline-block;
+      background: rgba(0,255,213,.1);
+      color: var(--glow);
+      font-size: 9px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      border: 1px solid var(--glow-mid);
       font-family: var(--mono);
       margin-left: 4px;
       letter-spacing: 1px;
@@ -532,17 +680,10 @@
       align-items: center;
     }
 
-    footer .seg span {
-      color: var(--text);
-    }
+    footer .seg span { color: var(--text); }
+    footer .sep { flex: 1; }
 
-    footer .sep {
-      flex: 1;
-    }
-
-    #hard-stop-count {
-      color: var(--red);
-    }
+    #hard-stop-count { color: var(--red); }
 
     /* ── Mute button ──────────────────────────────────────────────── */
     #mute-btn {
@@ -559,9 +700,7 @@
       letter-spacing: 1px;
     }
 
-    #mute-btn:hover {
-      background: rgba(0, 255, 213, .2);
-    }
+    #mute-btn:hover { background: rgba(0,255,213,.2); }
 
     #mute-btn.muted {
       border-color: var(--text-dim);
@@ -596,12 +735,30 @@
       </div>
       <div class="camera-overlay"></div>
       <div class="camera-label">LIVE · ONBOARD CAM</div>
+
+      <!-- Remote control banner -->
+      <div id="control-banner"></div>
+
+      <!-- D-Pad (shown when you're in control) -->
+      <div id="dpad-overlay">
+        <div class="dpad-row">
+          <button class="dpad-btn" data-dir="forward" title="Forward [W/↑]">▲</button>
+        </div>
+        <div class="dpad-row">
+          <button class="dpad-btn" data-dir="left"    title="Left [A/←]">◀</button>
+          <button class="dpad-btn dpad-center" data-dir="stop" title="Stop [Space]">■</button>
+          <button class="dpad-btn" data-dir="right"   title="Right [D/→]">▶</button>
+        </div>
+        <div class="dpad-row">
+          <button class="dpad-btn" data-dir="backward" title="Backward [S/↓]">▼</button>
+        </div>
+      </div>
     </div>
 
     <!-- ── Sidebar ─────────────────────────────────────────────────── -->
     <aside class="sidebar">
 
-      <!-- Personality card -->
+      <!-- Personality card + switcher -->
       <div class="personality-card">
         <div class="label">ACTIVE PERSONALITY</div>
         <div class="personality-name">
@@ -609,6 +766,9 @@
           <span class="name-text" id="p-name">—</span>
         </div>
         <div class="personality-bias" id="p-bias">–</div>
+        <div class="persona-switcher" id="persona-switcher">
+          <!-- buttons injected by JS -->
+        </div>
       </div>
 
       <!-- Thought bubble -->
@@ -633,6 +793,20 @@
         </div>
       </div>
 
+      <!-- Remote Control / Queue panel -->
+      <div class="control-section">
+        <div class="label">REMOTE CONTROL</div>
+        <div id="join-form">
+          <input id="join-name" type="text" maxlength="32" placeholder="your name…" autocomplete="off">
+          <button id="join-btn">JOIN</button>
+          <button id="leave-btn">LEAVE</button>
+        </div>
+        <div id="queue-status"></div>
+        <div id="timer-bar-wrap">
+          <div class="timer-bar-bg"><div id="timer-bar-fill"></div></div>
+        </div>
+      </div>
+
       <!-- Event log -->
       <div class="log-section">
         <div class="log-header">EVENT LOG</div>
@@ -652,35 +826,49 @@
   </div>
 
   <script>
-    // ── Personality metadata (mirrors middleware PERSONALITIES dict) ──
+    // ── Personality metadata ───────────────────────────────────────────
     const PERSONALITIES = {
-      benson: {
-        name: "BENSON", emoji: "🦺", color: "#f59e0b", bias: "Methodical · centre-of-path · zero-risk tolerance",
-        voiceHints: ["Alex", "Daniel", "Fred", "Ralph"]
-      },
-      sir_david: {
-        name: "Sir David", emoji: "🎙️", color: "#10b981", bias: "Curiosity-driven · moves toward interesting objects",
-        voiceHints: ["Daniel", "Arthur", "Oliver", "Rishi"]
-      },
-      klaus: {
-        name: "Klaus", emoji: "🎨", color: "#8b5cf6", bias: "Perimeter-hugging · wide arcing turns",
-        voiceHints: ["Martha", "Victoria", "Serena", "Moira"]
-      },
-      zog7: {
-        name: "Zog-7", emoji: "👾", color: "#06b6d4", bias: "Stealthy · shadow-seeking · wall-hugging",
-        voiceHints: ["Zarvox", "Trinoids", "Albert", "Cellos"]
-      },
+      benson:    { name: "BENSON",    emoji: "🦺", color: "#f59e0b", bias: "Methodical · centre-of-path · zero-risk tolerance", voiceHints: ["Alex","Daniel","Fred","Ralph"] },
+      sir_david: { name: "Sir David", emoji: "🎙️", color: "#10b981", bias: "Curiosity-driven · moves toward interesting objects",  voiceHints: ["Daniel","Arthur","Oliver","Rishi"] },
+      klaus:     { name: "Klaus",     emoji: "🎨", color: "#8b5cf6", bias: "Perimeter-hugging · wide arcing turns",                voiceHints: ["Martha","Victoria","Serena","Moira"] },
+      zog7:      { name: "Zog-7",     emoji: "👾", color: "#06b6d4", bias: "Stealthy · shadow-seeking · wall-hugging",             voiceHints: ["Zarvox","Trinoids","Albert","Cellos"] },
     };
+
+    // ── Persona switcher buttons ───────────────────────────────────────
+    const $switcher = document.getElementById('persona-switcher');
+    Object.entries(PERSONALITIES).forEach(([key, p]) => {
+      const btn = document.createElement('button');
+      btn.className = 'persona-btn';
+      btn.dataset.key = key;
+      btn.style.setProperty('--p-btn-color', p.color);
+      btn.textContent = p.emoji;
+      btn.title = p.name;
+      btn.addEventListener('click', () => switchPersona(key));
+      $switcher.appendChild(btn);
+    });
+
+    function switchPersona(key) {
+      fetch('/persona', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ persona: key }),
+      }).catch(console.error);
+    }
+
+    function updatePersonaSwitcher(activeKey) {
+      $switcher.querySelectorAll('.persona-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.key === activeKey);
+      });
+    }
 
     // ── Voice engine ───────────────────────────────────────────────────
     const synth = window.speechSynthesis;
     let isMuted = false;
     let activeVoice = null;
     let currentPersonalityKey = 'benson';
-    let hasUserGesture = false;  // browsers block TTS until first interaction
-    let pendingThought = null;  // first thought buffered until gesture
+    let hasUserGesture = false;
+    let pendingThought = null;
 
-    // Pick the best available voice for a personality
     function pickVoice(key) {
       const hints = (PERSONALITIES[key] || {}).voiceHints || [];
       const voices = synth.getVoices();
@@ -700,14 +888,12 @@
       synth.speak(utter);
     }
 
-    // Speak — buffers silently if no user gesture has happened yet
     function speak(text) {
       if (isMuted || !text || !synth) return;
       if (!hasUserGesture) { pendingThought = text; return; }
       doSpeak(text);
     }
 
-    // On first gesture, unlock audio and drain any buffered thought
     function onFirstGesture() {
       if (hasUserGesture) return;
       hasUserGesture = true;
@@ -716,47 +902,54 @@
     document.addEventListener('click', onFirstGesture);
     document.addEventListener('keydown', onFirstGesture);
 
-    // Voices load async on some browsers
     synth.onvoiceschanged = () => { activeVoice = pickVoice(currentPersonalityKey); };
     activeVoice = pickVoice(currentPersonalityKey);
 
-    // Mute toggle
     const $muteBtn = document.getElementById('mute-btn');
     $muteBtn.addEventListener('click', () => {
       isMuted = !isMuted;
       if (isMuted) { synth.cancel(); $muteBtn.textContent = '🔇 MUTED'; $muteBtn.classList.add('muted'); }
-      else { $muteBtn.textContent = '🔊 VOICE'; $muteBtn.classList.remove('muted'); }
+      else          { $muteBtn.textContent = '🔊 VOICE'; $muteBtn.classList.remove('muted'); }
     });
 
-
     // ── DOM refs ──────────────────────────────────────────────────────
-    const $feed = document.getElementById('camera-feed');
-    const $noFeed = document.getElementById('no-feed');
-    const $thought = document.getElementById('thought-text');
-    const $action = document.getElementById('action-badge');
-    const $distVal = document.getElementById('dist-value');
-    const $distBar = document.getElementById('dist-bar-fill');
-    const $log = document.getElementById('event-log');
-    const $cycle = document.getElementById('cycle-badge');
-    const $status = document.getElementById('status-badge');
-    const $dot = document.getElementById('conn-dot');
-    const $pEmoji = document.getElementById('p-emoji');
-    const $pName = document.getElementById('p-name');
-    const $pBias = document.getElementById('p-bias');
-    const $stops = document.getElementById('hard-stop-count');
-    const $duration = document.getElementById('footer-duration');
+    const $feed      = document.getElementById('camera-feed');
+    const $noFeed    = document.getElementById('no-feed');
+    const $thought   = document.getElementById('thought-text');
+    const $action    = document.getElementById('action-badge');
+    const $distVal   = document.getElementById('dist-value');
+    const $distBar   = document.getElementById('dist-bar-fill');
+    const $log       = document.getElementById('event-log');
+    const $cycle     = document.getElementById('cycle-badge');
+    const $status    = document.getElementById('status-badge');
+    const $dot       = document.getElementById('conn-dot');
+    const $pEmoji    = document.getElementById('p-emoji');
+    const $pName     = document.getElementById('p-name');
+    const $pBias     = document.getElementById('p-bias');
+    const $stops     = document.getElementById('hard-stop-count');
+    const $duration  = document.getElementById('footer-duration');
+
+    // Control / queue refs
+    const $joinName     = document.getElementById('join-name');
+    const $joinBtn      = document.getElementById('join-btn');
+    const $leaveBtn     = document.getElementById('leave-btn');
+    const $queueStatus  = document.getElementById('queue-status');
+    const $timerWrap    = document.getElementById('timer-bar-wrap');
+    const $timerFill    = document.getElementById('timer-bar-fill');
+    const $dpad         = document.getElementById('dpad-overlay');
+    const $banner       = document.getElementById('control-banner');
 
     let hardStopCount = 0;
     let lastThought = '';
     let typewriterTimer = null;
 
-    // ── Typewriter effect ──────────────────────────────────────────────
+    // ── Typewriter ────────────────────────────────────────────────────
     function typewrite(text) {
       if (text === lastThought) return;
       lastThought = text;
       clearTimeout(typewriterTimer);
       $thought.textContent = '';
-      speak(text);   // 🔊 narrate the new thought
+      speak(text);
       let i = 0;
       const step = () => {
         if (i < text.length) {
@@ -767,24 +960,19 @@
       step();
     }
 
-    // ── Update distance bar & value ────────────────────────────────────
+    // ── Distance bar ──────────────────────────────────────────────────
     function updateDistance(cm) {
-      const MAX_CM = 200;
-      const frac = Math.min(cm, MAX_CM) / MAX_CM;
-      const pct = Math.round(frac * 100);
-      const danger = cm < 10;
-      const warn = cm < 30;
-
+      const frac = Math.min(cm, 200) / 200;
+      const danger = cm < 10, warn = cm < 30;
       $distVal.textContent = cm >= 900 ? '∞  cm' : `${cm.toFixed(1)} cm`;
       $distVal.style.color = danger ? '#ef4444' : warn ? '#f59e0b' : '#00ffd5';
-      $distBar.style.width = `${pct}%`;
+      $distBar.style.width = `${Math.round(frac * 100)}%`;
       $distBar.style.background = danger ? '#ef4444' : warn ? '#f59e0b' : '#00ffd5';
       $distBar.style.boxShadow = `0 0 6px ${danger ? '#ef4444' : warn ? '#f59e0b' : '#00ffd5'}`;
     }
 
-    // ── Update action badge ────────────────────────────────────────────
+    // ── Action badge ──────────────────────────────────────────────────
     function updateAction(action, safety) {
-      const classes = 'action-badge action-forward action-backward action-left action-right action-stop safety-active';
       $action.className = `action-badge action-${action}`;
       $action.textContent = action.toUpperCase();
       if (safety) {
@@ -794,7 +982,7 @@
       }
     }
 
-    // ── Update personality panel ───────────────────────────────────────
+    // ── Personality panel ─────────────────────────────────────────────
     function updatePersonality(key) {
       const p = PERSONALITIES[key] || {};
       $pEmoji.textContent = p.emoji || '🤖';
@@ -803,64 +991,262 @@
       $pName.style.textShadow = `0 0 20px ${p.color || '#00ffd5'}`;
       $pBias.textContent = p.bias || '';
       document.documentElement.style.setProperty('--p-color', p.color || '#00ffd5');
-      // Reselect voice when personality changes
       if (key !== currentPersonalityKey) {
         currentPersonalityKey = key;
         activeVoice = pickVoice(key);
       }
+      updatePersonaSwitcher(key);
     }
 
-    // ── Append event log entry ─────────────────────────────────────────
+    // ── Event log ─────────────────────────────────────────────────────
     function appendLog(data) {
+      const isRemote = data.command_source === 'remote';
       const el = document.createElement('div');
       el.className = `log-entry ${data.action}`;
       el.innerHTML = `
-    <div class="log-meta">
-      <span>${data.ts || ''}</span>
-      <span class="log-action-tag">${data.action.toUpperCase()}${data.duration_ms ? ` · ${data.duration_ms}ms` : ''}</span>
-      <span>${data.distance_cm < 900 ? data.distance_cm.toFixed(1) + ' cm' : '∞'}</span>
-      ${data.safety ? '<span class="safety-tag">⚠ HARD STOP</span>' : ''}
-    </div>
-    <div class="log-thought">"${data.thought || ''}"</div>`;
-
+        <div class="log-meta">
+          <span>${data.ts || ''}</span>
+          <span class="log-action-tag">${data.action.toUpperCase()}${data.duration_ms ? ` · ${data.duration_ms}ms` : ''}</span>
+          <span>${data.distance_cm < 900 ? data.distance_cm.toFixed(1) + ' cm' : '∞'}</span>
+          ${data.safety ? '<span class="safety-tag">⚠ HARD STOP</span>' : ''}
+          ${isRemote ? `<span class="remote-tag">🎮 ${data.remote_controller || 'human'}</span>` : ''}
+        </div>
+        <div class="log-thought">"${data.thought || ''}"</div>`;
       $log.prepend(el);
-
-      // Trim old entries
       while ($log.children.length > 20) $log.removeChild($log.lastChild);
     }
 
-    // ── Process SSE event ──────────────────────────────────────────────
+    // ── Remote control session ────────────────────────────────────────
+    let myToken = null;
+    let myName  = null;
+    let myQueuePos = null;
+    let controlBudget = 60;
+    let lastRemoteData = {};
+
+    // Join the queue
+    $joinBtn.addEventListener('click', async () => {
+      const name = $joinName.value.trim();
+      if (!name) { $joinName.focus(); return; }
+      try {
+        const res = await fetch('/queue/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          myToken = data.token;
+          myName  = name;
+          myQueuePos = data.position;
+          controlBudget = data.budget_sec || 60;
+          $joinName.disabled = true;
+          $joinBtn.style.display = 'none';
+          $leaveBtn.style.display = '';
+          updateQueueUI(lastRemoteData);
+        } else {
+          alert(data.error || 'Could not join queue');
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    });
+
+    // Leave the queue
+    $leaveBtn.addEventListener('click', async () => {
+      if (!myToken) return;
+      await fetch('/queue/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: myToken }),
+      }).catch(console.error);
+      clearSession();
+      updateQueueUI(lastRemoteData);
+    });
+
+    function clearSession() {
+      myToken = null;
+      myName  = null;
+      myQueuePos = null;
+      $joinName.disabled = false;
+      $joinBtn.style.display = '';
+      $leaveBtn.style.display = 'none';
+      $dpad.classList.remove('visible');
+      $banner.classList.remove('visible');
+      $timerWrap.classList.remove('visible');
+    }
+
+    // Update queue status display from SSE data
+    function updateQueueUI(data) {
+      lastRemoteData = data;
+      const controller = data.remote_controller || '';
+      const qLen      = data.remote_queue_length || 0;
+      const remaining = data.remote_remaining_s || 0;
+      const isActive  = data.remote_is_active;
+
+      const imController = myToken && controller === myName && isActive;
+      const imInQueue     = myToken && qLen > 0;
+
+      // D-pad and control banner
+      if (imController) {
+        $dpad.classList.add('visible');
+        $banner.textContent = `🎮 YOU ARE IN CONTROL · ${Math.ceil(remaining)}s`;
+        $banner.classList.add('visible');
+        $timerWrap.classList.add('visible');
+        const pct = Math.max(0, (remaining / controlBudget) * 100);
+        $timerFill.style.width = pct + '%';
+        $timerFill.style.background = pct < 25 ? '#ef4444' : pct < 50 ? '#f59e0b' : '#22c55e';
+      } else {
+        $dpad.classList.remove('visible');
+        $banner.classList.remove('visible');
+        // Show timer for head of queue (not yet active)
+        if (myToken && controller === myName && !isActive) {
+          $timerWrap.classList.add('visible');
+          const pct = Math.max(0, (remaining / controlBudget) * 100);
+          $timerFill.style.width = pct + '%';
+          $timerFill.style.background = '#f59e0b';
+        } else {
+          $timerWrap.classList.remove('visible');
+        }
+      }
+
+      // Text status
+      let lines = [];
+      if (controller && isActive) {
+        lines.push(`<span class="${controller === myName ? 'qs-you' : 'qs-controller'}">🎮 ${controller} in control · ${Math.ceil(remaining)}s</span>`);
+      } else if (controller && !isActive) {
+        lines.push(`<span class="qs-waiting">⏳ ${controller} up next — start pressing keys</span>`);
+      }
+      if (qLen > 1) {
+        lines.push(`<span>${qLen - 1} waiting in queue</span>`);
+      }
+      if (!myToken) {
+        if (qLen === 0) lines.push('No one in queue · enter your name to take control');
+        else lines.push('Enter your name to join the queue');
+      } else if (!imController && controller !== myName) {
+        lines.push(`<span class="qs-you">You are in queue — ${qLen} ahead</span>`);
+      }
+      $queueStatus.innerHTML = lines.join('<br>');
+
+      // Session expiry detection (server will have removed us)
+      if (myToken && controller && qLen > 0) {
+        // We're still in system, check if our remaining is 0 and we were controller
+        if (imController && remaining <= 0) {
+          clearSession();
+        }
+      }
+    }
+
+    // ── D-Pad & keyboard control ──────────────────────────────────────
+    const heldKeys = new Set();
+    let cmdInterval = null;
+    let activeDir = null;
+
+    const KEY_DIR_MAP = {
+      ArrowUp: 'forward', w: 'forward', W: 'forward',
+      ArrowDown: 'backward', s: 'backward', S: 'backward',
+      ArrowLeft: 'left', a: 'left', A: 'left',
+      ArrowRight: 'right', d: 'right', D: 'right',
+      ' ': 'stop',
+    };
+
+    function isMyTurn() {
+      return myToken && lastRemoteData.remote_controller === myName;
+    }
+
+    function startSending(dir) {
+      if (activeDir === dir) return;
+      stopSending();
+      activeDir = dir;
+      sendCommand(dir);
+      if (dir !== 'stop') {
+        cmdInterval = setInterval(() => sendCommand(dir), 350);
+      }
+      highlightDpadBtn(dir, true);
+    }
+
+    function stopSending() {
+      if (cmdInterval) { clearInterval(cmdInterval); cmdInterval = null; }
+      if (activeDir && activeDir !== 'stop') {
+        sendCommand('stop');
+      }
+      highlightDpadBtn(activeDir, false);
+      activeDir = null;
+    }
+
+    async function sendCommand(dir) {
+      if (!myToken) return;
+      try {
+        await fetch('/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: myToken, direction: dir }),
+        });
+      } catch (e) { /* ignore transient errors */ }
+    }
+
+    function highlightDpadBtn(dir, on) {
+      $dpad.querySelectorAll('.dpad-btn').forEach(btn => {
+        if (btn.dataset.dir === dir) btn.classList.toggle('pressed', on);
+      });
+    }
+
+    // Keyboard events
+    document.addEventListener('keydown', e => {
+      if (!isMyTurn()) return;
+      if (e.target === $joinName) return;
+      const dir = KEY_DIR_MAP[e.key];
+      if (!dir) return;
+      e.preventDefault();
+      if (heldKeys.has(e.key)) return;
+      heldKeys.add(e.key);
+      startSending(dir);
+    });
+
+    document.addEventListener('keyup', e => {
+      const dir = KEY_DIR_MAP[e.key];
+      if (!dir) return;
+      heldKeys.delete(e.key);
+      if (activeDir === dir && heldKeys.size === 0) stopSending();
+    });
+
+    // D-Pad button events (pointer for touch + mouse)
+    $dpad.querySelectorAll('.dpad-btn').forEach(btn => {
+      const dir = btn.dataset.dir;
+
+      btn.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        btn.setPointerCapture(e.pointerId);
+        startSending(dir);
+      });
+
+      btn.addEventListener('pointerup', e => {
+        e.preventDefault();
+        if (activeDir === dir) stopSending();
+      });
+
+      btn.addEventListener('pointercancel', () => {
+        if (activeDir === dir) stopSending();
+      });
+    });
+
+    // ── Process SSE event ─────────────────────────────────────────────
     function handleEvent(data) {
-      // Camera feed
       if (data.frame_b64) {
         $feed.src = 'data:image/jpeg;base64,' + data.frame_b64;
         $feed.style.display = 'block';
         $noFeed.style.display = 'none';
       }
-
-      // Personality
       if (data.personality) updatePersonality(data.personality);
-
-      // Thought — use != null so an empty string still triggers the update
-      if (data.thought != null) typewrite(data.thought || "…");
-
-      // Action badge
+      if (data.thought != null) typewrite(data.thought || '…');
       updateAction(data.action || 'stop', !!data.safety);
-
-      // Distance
       updateDistance(parseFloat(data.distance_cm) || 999);
-
-      // Cycle counter
       $cycle.textContent = `CYCLE ${data.cycle || 0}`;
-
-      // Footer
       if (data.duration_ms) $duration.textContent = `${data.duration_ms}ms`;
-
-      // Log
       appendLog(data);
+      updateQueueUI(data);
     }
 
-    // ── SSE connection ─────────────────────────────────────────────────
+    // ── SSE connection ────────────────────────────────────────────────
     function connect() {
       $status.textContent = 'CONNECTING…';
       $dot.classList.remove('live');
@@ -873,11 +1259,8 @@
       };
 
       es.onmessage = (e) => {
-        try {
-          handleEvent(JSON.parse(e.data));
-        } catch (err) {
-          console.error('Parse error:', err);
-        }
+        try { handleEvent(JSON.parse(e.data)); }
+        catch (err) { console.error('Parse error:', err); }
       };
 
       es.onerror = () => {
@@ -888,7 +1271,6 @@
       };
     }
 
-    // ── Init ───────────────────────────────────────────────────────────
     connect();
   </script>
 </body>

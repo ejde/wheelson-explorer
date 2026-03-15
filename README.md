@@ -4,9 +4,10 @@ Autonomous exploration stack for CircuitMess Wheelson using a **subsumption-type
 - firmware safety/reflexes,
 - deterministic local planning,
 - async VLM scene semantics,
-- persona-specific strategy.
+- persona-specific strategy,
+- **remote human override** with queued multi-viewer control.
 
-The system is designed so robot motion remains safe and deterministic even when VLM calls are slow or unavailable.
+The system is designed so robot motion remains safe and deterministic even when VLM calls are slow or unavailable — and human operators can take direct control at any time via the live dashboard.
 
 ## Architecture (Subsumption-Type)
 
@@ -30,10 +31,16 @@ Control is layered by priority. Higher-priority layers can suppress lower-priori
 4. **S3 Persona Strategist (middleware)**
 - Persona-specific motion doctrine and objectives
 - Distinct policies for `benson`, `sir_david`, `klaus`, `zog7`
+- Can be switched live via dashboard or `POST /persona` without restarting
 
 5. **S4 Semantic Interpreter (VLM, async advisory)**
 - VLM outputs scene semantics (`frontier`, `traversability`, `novelty`, `hazard`, `headlight`, `observation`) plus persona commentary text (`commentary`)
 - No direct motor commands from VLM
+
+6. **S5 Human Override (remote control)**
+- Takes priority over all planner/recovery layers
+- VLM scene analysis and persona thoughts continue running normally
+- On takeover: autonomous motion halts; on release: autonomy resumes seamlessly
 
 ### Control/Dataflow Diagram
 
@@ -44,6 +51,7 @@ flowchart TD
     VLM --> CONTRACT["Semantic Contract (TTL + Confirm Gates)"]
     LSCENE --> CONTRACT
 
+    HUMAN["S5 Human Override (remote control queue)"] --> AUTH
     CONTRACT --> STRAT["S3 Persona Strategist (objectives + doctrine)"]
     STRAT --> REC["S2 Recovery FSM (nudge/escape/hard_escape)"]
     REC --> AUTH["S1 Motion Authority (single writer + lease heartbeat)"]
@@ -81,12 +89,14 @@ Each persona has distinct:
 - commentary style,
 - degraded/timeout behavior.
 
-| Persona | Movement Signature | Primary Objective Style |
-|---|---|---|
-| `benson` | conservative, safety pauses, risk-first reroutes | compliance/safety sweep |
-| `sir_david` | curiosity arcs, novelty-biased approach/reframe | documentary exploration |
-| `klaus` | perimeter acquisition + wide signature arcs | spatial-flow/perimeter audit |
-| `zog7` | edge-cover seeking, concealment pauses, tactical resets | covert mapping / exposure minimization |
+| Persona | Emoji | Movement Signature | Primary Objective Style |
+|---|---|---|---|
+| `benson`    | 🦺 | conservative, safety pauses, risk-first reroutes   | compliance/safety sweep |
+| `sir_david` | 🎙️ | curiosity arcs, novelty-biased approach/reframe    | documentary exploration |
+| `klaus`     | 🎨 | perimeter acquisition + wide signature arcs        | spatial-flow/perimeter audit |
+| `zog7`      | 👾 | edge-cover seeking, concealment pauses, tactical resets | covert mapping / exposure minimization |
+
+Personas can be switched live from the dashboard or via `POST /persona` without restarting the middleware.
 
 ## Repository Structure
 
@@ -236,6 +246,10 @@ TIMEOUT_SCAN_STEPS=2
 TIMEOUT_SCAN_TURN_MS=700
 PLAN_LATCH_FORWARD_SEC=1.8
 PLAN_LATCH_TURN_SEC=0.9
+
+# Remote control
+CONTROL_BUDGET_SEC=60.0        # seconds each person in the queue gets to drive
+CONTROL_INACTIVITY_SEC=3.0     # seconds of no input before autonomy quietly resumes
 ```
 
 ### Run
@@ -254,11 +268,44 @@ CLI:
 python main.py [--provider gemini|ollama] [--model MODEL] [--personality NAME] [--port PORT]
 ```
 
+## Remote Control
+
+Any browser connected to the dashboard can queue up to drive Wheelson directly.
+
+### How it works
+
+1. Enter a name and click **JOIN** — you're added to the queue.
+2. When it's your turn, the D-pad appears on the camera feed and keyboard control activates.
+3. Drive with **WASD / arrow keys** or the on-screen D-pad. Holding a key sends repeated commands at ~350 ms intervals; releasing sends a stop.
+4. You have **60 seconds** (configurable). If you go idle for **3 seconds**, autonomy quietly resumes — but your slot stays in the queue until your budget expires or you click LEAVE.
+5. On session end (timeout or LEAVE), the next person in the queue becomes the active controller. Wheelson returns to full autonomous mode when the queue is empty.
+
+All viewers see a live countdown and who's currently in control via SSE. Safety layers (firmware obstacle detection, lease timeout) remain active regardless of who is driving.
+
+### Remote Control API
+
+| Endpoint | Body | Description |
+|---|---|---|
+| `POST /queue/join` | `{"name": "Alice"}` | Join the queue; returns `{token, position, budget_sec}` |
+| `POST /queue/leave` | `{"token": "..."}` | Leave the queue immediately |
+| `POST /control` | `{"token": "...", "direction": "forward\|backward\|left\|right\|stop"}` | Send a movement command (only works if you're first in queue) |
+| `GET /queue/status` | — | Current queue state and remaining budgets |
+
+### Persona Switching API
+
+| Endpoint | Body | Description |
+|---|---|---|
+| `POST /persona` | `{"persona": "benson\|sir_david\|klaus\|zog7"}` | Switch active persona live |
+
+The switch is applied on the next loop cycle: planner doctrine and VLM system prompt update atomically, no restart needed.
+
 ## Runtime Telemetry / Health
 
 ### Dashboard
 
 Default: [http://localhost:8000](http://localhost:8000)
+
+Features: live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay.
 
 ### `GET /health` (middleware)
 
@@ -275,6 +322,7 @@ Includes high-value runtime state:
 - `vlm_disabled_remaining_sec`
 - scene fields (`scene_frontier`, `scene_traversability`, `scene_novelty`, `scene_hazard`)
 - command authority fields (`command_id`, `command_source`, `command_mode`)
+- remote control fields (`remote_controller`, `remote_queue_length`, `remote_remaining_s`, `remote_is_active`)
 
 ## How Persona Interacts with VLM Now
 
