@@ -1385,7 +1385,7 @@
     // Keyboard events
     document.addEventListener('keydown', e => {
       if (!isMyTurn()) return;
-      if (e.target === $joinName) return;
+      if (e.target === $joinName || e.target === $chatInput) return;
       const dir = KEY_DIR_MAP[e.key];
       if (!dir) return;
       e.preventDefault();

@@ -47,7 +47,7 @@ Each layer can suppress the layers below it. **All motor commands go through a s
 | **S4 VLM Semantic Interpreter** | Async advisory only. Outputs scene fields (`frontier`, `traversability`, `novelty`, `hazard`) + persona `commentary`. **Never issues motor commands.** |
 | **S5 Human Override** | Remote control queue. Halts autonomous motion on takeover; autonomy resumes seamlessly on release/inactivity. |
 
-### Main Loop (`explorer_loop` in `middleware/main.py`)
+### Main Loop (`explorer_loop` in `middleware/loop.py`)
 
 One asyncio task running at `LOOP_INTERVAL_SEC`. Each cycle:
 1. Fetch JPEG + telemetry headers from `GET /camera` on the robot.
@@ -61,13 +61,13 @@ One asyncio task running at `LOOP_INTERVAL_SEC`. Each cycle:
 9. Otherwise: run Recovery FSM or apply the planner's `MotionPlan` via `MotionSupervisor`.
 10. Broadcast SSE event to all connected dashboard clients.
 
-### Key Classes (`middleware/main.py`)
+### Key Classes
 
-- **`AppState`** — module-level dataclass singleton (`state`). All shared mutable state between the loop and HTTP handlers lives here.
-- **`MotionSupervisor`** — asyncio-locked single writer. Exposed as module-level `_motion_supervisor` after loop startup so HTTP handlers (e.g. `POST /control`) can call `remote_move()` directly without going through the planner.
-- **`IntentPlanner`** — stateful; holds latched plans and per-persona arc counters. Call `set_persona()` to switch live.
-- **`RecoveryController`** — pure deterministic FSM; no VLM involvement.
-- **`ControlSession`** — dataclass tracking token, name, `joined_at`, `last_command_at` for queue management (`_control_queue` list + `_queue_lock`).
+- **`AppState`** (`state.py`) — module-level dataclass singleton (`state`). All shared mutable state between the loop and HTTP handlers lives here.
+- **`MotionSupervisor`** (`motion.py`) — asyncio-locked single writer. Exposed as module-level `_motion_supervisor` after loop startup so HTTP handlers (e.g. `POST /control`) can call `remote_move()` directly without going through the planner.
+- **`IntentPlanner`** (`planner.py`) — stateful; holds latched plans and per-persona arc counters. Call `set_persona()` to switch live.
+- **`RecoveryController`** (`recovery.py`) — pure deterministic FSM; no VLM involvement.
+- **`ControlSession`** (`state.py`) — dataclass tracking token, name, `joined_at`, `last_command_at` for queue management (`_control_queue` list + `_queue_lock`).
 
 ### VLM Safety Contract
 
@@ -89,10 +89,10 @@ Single static HTML file served by FastAPI — no build step. Connects to `GET /s
 
 ### Adding a New Persona
 
-Five touch-points all in `middleware/main.py`, plus one in `dashboard.html`:
-1. `PERSONALITIES` dict — name, emoji, color, system_prompt, move_bias.
-2. `PERSONA_POLICIES` — base_speed, safety/curiosity/perimeter weights, forward_burst_ms, hold_bias.
-3. `PERSONA_SALIENCE` and `PERSONA_COMMENTARY_STYLE` — VLM prompt hints.
-4. `TURN_DURATION_MS` — default turn length in ms.
-5. `_plan_<key>()` method in `IntentPlanner`, wired into `IntentPlanner.plan()`.
+Six touch-points across the middleware modules, plus one in `dashboard.html`:
+1. `PERSONALITIES` dict in `config.py` — name, emoji, color, system_prompt, move_bias.
+2. `PERSONA_POLICIES` in `config.py` — base_speed, safety/curiosity/perimeter weights, forward_burst_ms, hold_bias.
+3. `PERSONA_SALIENCE` and `PERSONA_COMMENTARY_STYLE` in `config.py` — VLM prompt hints.
+4. `TURN_DURATION_MS` in `config.py` — default turn length in ms.
+5. `_plan_<key>()` method in `IntentPlanner` (`planner.py`), wired into `IntentPlanner.plan()`.
 6. `PERSONALITIES` object in `dashboard.html` — emoji, color, bias text, voice hints.

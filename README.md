@@ -106,7 +106,16 @@ wheelson-explorer/
 │   └── wheelson_explorer/
 │       └── wheelson_explorer.ino
 ├── middleware/
-│   ├── main.py
+│   ├── main.py            # FastAPI app + CLI entry point
+│   ├── config.py          # Constants, persona dicts, env vars
+│   ├── state.py           # AppState singleton, queue, broadcast
+│   ├── loop.py            # explorer_loop (main control cycle)
+│   ├── motion.py          # WheelsonClient, MotionSupervisor
+│   ├── scene.py           # VLM calls, scene semantics, StrategyIntent
+│   ├── planner.py         # IntentPlanner (persona-specific planning)
+│   ├── recovery.py        # RecoveryController FSM
+│   ├── remote.py          # Queue/control/persona/chat endpoints
+│   ├── routes.py          # Dashboard, SSE, snapshot, health routes
 │   ├── dashboard.html
 │   ├── requirements.txt
 │   └── .env.example
@@ -299,13 +308,21 @@ All viewers see a live countdown and who's currently in control via SSE. Safety 
 
 The switch is applied on the next loop cycle: planner doctrine and VLM system prompt update atomically, no restart needed.
 
+### Chat API
+
+| Endpoint | Body | Description |
+|---|---|---|
+| `POST /chat` | `{"message": "What do you see?"}` | Chat with the active persona; returns in-character reply (max 3 sentences) |
+
+Responses are context-aware — the persona references the current scene and its recent observations. Rate-limited to 5 requests per minute (returns 429 with `retry_after_sec` on exceed). Chat uses text-only VLM calls, separate from the main scene-analysis loop.
+
 ## Runtime Telemetry / Health
 
 ### Dashboard
 
 Default: [http://localhost:8000](http://localhost:8000)
 
-Features: live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay.
+Features: live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay, in-character chat.
 
 ### `GET /health` (middleware)
 

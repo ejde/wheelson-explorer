@@ -155,8 +155,30 @@ void nuvotonBegin() {
   Serial.println("[NUVOTON] Reset complete");
 }
 
+// ─── FRAME ANALYSIS TIMING ──────────────────────────────────────────────────
+unsigned long lastAnalysisTime = 0;
+const int ANALYSIS_INTERVAL_MS = 150;
+
 // ─── JSON HELPERS ────────────────────────────────────────────────────────────
 // Lightweight replacements for ArduinoJson — no external library needed.
+
+/**
+ * Escape a string for safe inclusion in a JSON value.
+ * Handles quotes, backslashes, and control characters.
+ */
+String jsonEscape(const String &s) {
+  String result;
+  result.reserve(s.length() + 4);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '"') result += "\\\"";
+    else if (c == '\\') result += "\\\\";
+    else if (c == '\n') result += "\\n";
+    else if (c == '\r') result += "\\r";
+    else result += c;
+  }
+  return result;
+}
 
 /**
  * Extract a string value from a flat JSON object.
@@ -477,13 +499,7 @@ void handleCamera() {
     return;
   }
 
-  // Ensure telemetry is completely up-to-date for the current fetched frame
-  if (visual_rgb_buf) {
-    if (jpg2rgb565(fb->buf, fb->len, visual_rgb_buf, JPG_SCALE_NONE)) {
-      analyzeFrame(visual_rgb_buf, fb->width, fb->height);
-    }
-  }
-
+  // Telemetry headers use cached values from the periodic analysis in loop()
   server.sendHeader("X-Distance-CM", String(dist, 1));
   server.sendHeader("X-Raw-Pulse-US", String(lastEchoDuration));
   server.sendHeader("X-Visual-Obstacle",
@@ -516,12 +532,12 @@ void handleStatus() {
   float dist = readDistanceCM();
 
   String body = "{\"distance_cm\":\"" + String(dist, 1) + "\",\"ip\":\"" +
-                WiFi.localIP().toString() + "\",\"nav_state\":\"" +
+                jsonEscape(WiFi.localIP().toString()) + "\",\"nav_state\":\"" +
                 String(navStateName(navState)) + "\",\"command_id\":\"" +
-                activeCommandId + "\",\"source\":\"" + activeCommandSource +
-                "\",\"mode\":\"" + activeCommandMode + "\",\"safety_latched\":" +
+                jsonEscape(activeCommandId) + "\",\"source\":\"" + jsonEscape(activeCommandSource) +
+                "\",\"mode\":\"" + jsonEscape(activeCommandMode) + "\",\"safety_latched\":" +
                 String(safetyStopLatched ? "true" : "false") +
-                ",\"safety_reason\":\"" + safetyStopReason + "\"}";
+                ",\"safety_reason\":\"" + jsonEscape(safetyStopReason) + "\"}";
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", body);
@@ -575,13 +591,13 @@ void handleMove() {
                   (int)currentSpeed, forwardSpeed);
 
     String boolStr = safety_fired ? "true" : "false";
-    String resp = "{\"ok\":true,\"command\":\"set_speed\",\"level\":\"" + level +
+    String resp = "{\"ok\":true,\"command\":\"set_speed\",\"level\":\"" + jsonEscape(level) +
                   "\",\"base_speed\":" + String((int)currentSpeed) +
                   ",\"forward_speed\":" + String(forwardSpeed) +
                   ",\"safety\":" + boolStr + ",\"safety_reason\":\"" +
-                  safetyReason + "\",\"command_id\":\"" + activeCommandId +
-                  "\",\"source\":\"" + activeCommandSource +
-                  "\",\"mode\":\"" + activeCommandMode + "\"}";
+                  jsonEscape(safetyReason) + "\",\"command_id\":\"" + jsonEscape(activeCommandId) +
+                  "\",\"source\":\"" + jsonEscape(activeCommandSource) +
+                  "\",\"mode\":\"" + jsonEscape(activeCommandMode) + "\"}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", resp);
     return;
@@ -591,11 +607,11 @@ void handleMove() {
     setHeadlight(brightness);
 
     String boolStr = safety_fired ? "true" : "false";
-    String resp = "{\"ok\":true,\"command\":\"set_light\",\"level\":\"" + level +
+    String resp = "{\"ok\":true,\"command\":\"set_light\",\"level\":\"" + jsonEscape(level) +
                   "\",\"safety\":" + boolStr + ",\"safety_reason\":\"" +
-                  safetyReason + "\",\"command_id\":\"" + activeCommandId +
-                  "\",\"source\":\"" + activeCommandSource +
-                  "\",\"mode\":\"" + activeCommandMode + "\"}";
+                  jsonEscape(safetyReason) + "\",\"command_id\":\"" + jsonEscape(activeCommandId) +
+                  "\",\"source\":\"" + jsonEscape(activeCommandSource) +
+                  "\",\"mode\":\"" + jsonEscape(activeCommandMode) + "\"}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", resp);
     return;
@@ -616,10 +632,10 @@ void handleMove() {
     navState = NAV_HOLD;
     String boolStr = safety_fired ? "true" : "false";
     String resp = "{\"ok\":true,\"action\":\"stop\",\"duration_ms\":0,\"safety\":" +
-                  boolStr + ",\"safety_reason\":\"" + safetyReason +
-                  "\",\"busy\":false,\"command_id\":\"" + activeCommandId +
-                  "\",\"source\":\"" + activeCommandSource +
-                  "\",\"mode\":\"" + activeCommandMode +
+                  boolStr + ",\"safety_reason\":\"" + jsonEscape(safetyReason) +
+                  "\",\"busy\":false,\"command_id\":\"" + jsonEscape(activeCommandId) +
+                  "\",\"source\":\"" + jsonEscape(activeCommandSource) +
+                  "\",\"mode\":\"" + jsonEscape(activeCommandMode) +
                   "\",\"nav_state\":\"" + String(navStateName(navState)) + "\"}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", resp);
@@ -683,13 +699,13 @@ void handleMove() {
     stopMotors();
 
   String boolStr = safety_fired ? "true" : "false";
-  String resp = "{\"ok\":true,\"action\":\"" + action +
+  String resp = "{\"ok\":true,\"action\":\"" + jsonEscape(action) +
                 "\",\"duration_ms\":" + duration_ms + ",\"distance_cm\":\"" +
                 String(dist, 1) + "\",\"safety\":" + boolStr +
-                ",\"safety_reason\":\"" + safetyReason +
-                "\",\"busy\":false,\"command_id\":\"" + activeCommandId +
-                "\",\"source\":\"" + activeCommandSource +
-                "\",\"mode\":\"" + activeCommandMode + "\",\"nav_state\":\"" +
+                ",\"safety_reason\":\"" + jsonEscape(safetyReason) +
+                "\",\"busy\":false,\"command_id\":\"" + jsonEscape(activeCommandId) +
+                "\",\"source\":\"" + jsonEscape(activeCommandSource) +
+                "\",\"mode\":\"" + jsonEscape(activeCommandMode) + "\",\"nav_state\":\"" +
                 String(navStateName(navState)) + "\"}";
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -788,29 +804,24 @@ void loop() {
         now - lastLeaseCommandTime);
   }
 
-  // Reactive hard-stop only (no autonomous turn/backup planning in firmware).
-  if (navState == NAV_CRUISE && currentMoveAction == "forward" &&
-      (now - lastDistanceCheckTime >= DISTANCE_CHECK_INTERVAL_MS)) {
-    lastDistanceCheckTime = now;
+  // Periodic frame analysis — runs unconditionally so telemetry is always fresh
+  // for both the safety check and /camera HTTP responses.
+  if (now - lastAnalysisTime >= ANALYSIS_INTERVAL_MS) {
+    lastAnalysisTime = now;
 
-    bool blockedByVision = false;
-
-    // Execute Edge-AI visual check if we have the buffer
     if (visual_rgb_buf) {
       camera_fb_t *fb = esp_camera_fb_get();
       if (fb) {
-        // Decode JPEG to RGB565 directly into our PSRAM buffer
         if (jpg2rgb565(fb->buf, fb->len, visual_rgb_buf, JPG_SCALE_NONE)) {
           analyzeFrame(visual_rgb_buf, fb->width, fb->height);
-          if (telemetryObstructed) {
-            blockedByVision = true;
-          }
         }
         esp_camera_fb_return(fb);
       }
     }
 
-    if (blockedByVision) {
+    // Reactive hard-stop: if cruising forward and vision detects obstacle
+    if (navState == NAV_CRUISE && currentMoveAction == "forward" &&
+        telemetryObstructed) {
       stopMotors();
       currentMoveAction = "stop";
       commandedAction = "stop";
