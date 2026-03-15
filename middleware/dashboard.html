@@ -565,25 +565,68 @@
       transition: width .5s linear, background .3s;
     }
 
-    /* ── Event Log ────────────────────────────────────────────────── */
+    /* ── Log / Chat Tabs ──────────────────────────────────────────── */
     .log-section {
       flex: 1;
       display: flex;
       flex-direction: column;
       overflow: hidden;
       background: var(--bg);
+      min-height: 0;
     }
 
-    .log-header {
-      padding: 10px 18px;
+    .tab-bar {
+      display: flex;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      flex: 1;
       font-family: var(--mono);
       font-size: 10px;
-      color: var(--text-dim);
       letter-spacing: 2px;
-      border-bottom: 1px solid var(--border);
-      background: var(--bg2);
+      padding: 9px 0;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: color .2s, border-color .2s;
+      position: relative;
     }
 
+    .tab-btn.active {
+      color: var(--glow);
+      border-bottom-color: var(--glow);
+    }
+
+    .tab-btn .unread-dot {
+      position: absolute;
+      top: 6px;
+      right: 24px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      display: none;
+    }
+
+    .tab-btn .unread-dot.visible { display: block; }
+
+    .tab-pane {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .tab-pane.active { display: flex; }
+
+    /* ── Event Log ────────────────────────────────────────────────── */
     #event-log {
       flex: 1;
       overflow-y: auto;
@@ -658,6 +701,135 @@
       font-family: var(--mono);
       margin-left: 4px;
       letter-spacing: 1px;
+    }
+
+    /* ── Chat Panel ───────────────────────────────────────────────── */
+    #chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    #chat-messages::-webkit-scrollbar { width: 4px; }
+    #chat-messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .chat-bubble-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      animation: fadeIn .3s ease;
+    }
+
+    .chat-bubble-wrap.from-user { align-items: flex-end; }
+    .chat-bubble-wrap.from-bot  { align-items: flex-start; }
+
+    .chat-meta {
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--text-dim);
+      padding: 0 6px;
+    }
+
+    .chat-bubble {
+      max-width: 88%;
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .from-user .chat-bubble {
+      background: rgba(0, 255, 213, .1);
+      border: 1px solid var(--glow-mid);
+      color: var(--text-bright);
+      border-bottom-right-radius: 3px;
+    }
+
+    .from-bot .chat-bubble {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-bottom-left-radius: 3px;
+      font-style: italic;
+    }
+
+    .bot-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--p-color, var(--glow));
+      padding: 0 6px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .chat-input-row {
+      display: flex;
+      gap: 6px;
+      padding: 10px 12px;
+      background: var(--bg2);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #chat-input {
+      flex: 1;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text-bright);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 6px 10px;
+      outline: none;
+      transition: border-color .2s;
+    }
+
+    #chat-input:focus { border-color: var(--glow-mid); }
+
+    #chat-send {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--glow-mid);
+      background: var(--glow-dim);
+      color: var(--glow);
+      cursor: pointer;
+      transition: all .2s;
+      letter-spacing: 1px;
+      white-space: nowrap;
+    }
+
+    #chat-send:hover:not(:disabled) { background: rgba(0,255,213,.2); }
+    #chat-send:disabled { opacity: .4; cursor: default; }
+
+    .chat-thinking {
+      display: flex;
+      gap: 4px;
+      padding: 6px 12px;
+      align-items: center;
+    }
+
+    .chat-thinking span {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      animation: thinking-pulse 1.2s ease-in-out infinite;
+    }
+
+    .chat-thinking span:nth-child(2) { animation-delay: .2s; }
+    .chat-thinking span:nth-child(3) { animation-delay: .4s; }
+
+    @keyframes thinking-pulse {
+      0%, 80%, 100% { opacity: .3; transform: scale(.8); }
+      40% { opacity: 1; transform: scale(1); }
     }
 
     /* ── Status Bar ───────────────────────────────────────────────── */
@@ -807,10 +979,30 @@
         </div>
       </div>
 
-      <!-- Event log -->
+      <!-- Log / Chat tabs -->
       <div class="log-section">
-        <div class="log-header">EVENT LOG</div>
-        <div id="event-log"></div>
+        <div class="tab-bar">
+          <button class="tab-btn active" data-tab="log">
+            EVENT LOG
+          </button>
+          <button class="tab-btn" data-tab="chat">
+            CHAT
+            <span class="unread-dot" id="chat-unread"></span>
+          </button>
+        </div>
+
+        <div class="tab-pane active" id="tab-log">
+          <div id="event-log"></div>
+        </div>
+
+        <div class="tab-pane" id="tab-chat">
+          <div id="chat-messages"></div>
+          <div class="chat-input-row">
+            <input id="chat-input" type="text" maxlength="300"
+              placeholder="ask wheelson something…" autocomplete="off">
+            <button id="chat-send">SEND</button>
+          </div>
+        </div>
       </div>
 
     </aside>
@@ -1229,8 +1421,132 @@
       });
     });
 
+    // ── Tab switching ─────────────────────────────────────────────────
+    const $tabBtns  = document.querySelectorAll('.tab-btn');
+    const $tabPanes = document.querySelectorAll('.tab-pane');
+    const $chatUnread = document.getElementById('chat-unread');
+    let activeTab = 'log';
+
+    $tabBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        activeTab = tab;
+        $tabBtns.forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+        $tabPanes.forEach(p => p.classList.toggle('active', p.id === `tab-${tab}`));
+        if (tab === 'chat') {
+          $chatUnread.classList.remove('visible');
+          // Scroll chat to bottom when switching to it
+          const $cm = document.getElementById('chat-messages');
+          $cm.scrollTop = $cm.scrollHeight;
+        }
+      });
+    });
+
+    // ── Chat ──────────────────────────────────────────────────────────
+    const $chatInput  = document.getElementById('chat-input');
+    const $chatSend   = document.getElementById('chat-send');
+    const $chatMsgs   = document.getElementById('chat-messages');
+
+    // Remember chat name across sessions; default to control queue name if set
+    function getChatName() {
+      return myName || localStorage.getItem('wheelson_chat_name') || 'visitor';
+    }
+
+    function appendChatBubble({ from, message, response, p_emoji, p_name, ts, personality }) {
+      const p = PERSONALITIES[personality] || {};
+      const color = p.color || '#00ffd5';
+
+      // User bubble
+      const userWrap = document.createElement('div');
+      userWrap.className = 'chat-bubble-wrap from-user';
+      userWrap.innerHTML = `
+        <div class="chat-meta">${from} · ${ts}</div>
+        <div class="chat-bubble">${escHtml(message)}</div>`;
+      $chatMsgs.appendChild(userWrap);
+
+      // Bot bubble
+      const botWrap = document.createElement('div');
+      botWrap.className = 'chat-bubble-wrap from-bot';
+      botWrap.innerHTML = `
+        <div class="bot-label" style="color:${color}">${p_emoji || p.emoji || '🤖'} ${p_name || p.name || 'Wheelson'}</div>
+        <div class="chat-bubble">${escHtml(response)}</div>`;
+      $chatMsgs.appendChild(botWrap);
+
+      $chatMsgs.scrollTop = $chatMsgs.scrollHeight;
+
+      // Unread dot when chat tab isn't active
+      if (activeTab !== 'chat') {
+        $chatUnread.classList.add('visible');
+      }
+
+      // Speak the response
+      speak(response);
+    }
+
+    function appendThinkingIndicator() {
+      const el = document.createElement('div');
+      el.className = 'chat-bubble-wrap from-bot';
+      el.id = 'chat-thinking-wrap';
+      el.innerHTML = `<div class="chat-thinking"><span></span><span></span><span></span></div>`;
+      $chatMsgs.appendChild(el);
+      $chatMsgs.scrollTop = $chatMsgs.scrollHeight;
+    }
+
+    function removeThinkingIndicator() {
+      document.getElementById('chat-thinking-wrap')?.remove();
+    }
+
+    function escHtml(str) {
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function sendChat() {
+      const message = $chatInput.value.trim();
+      if (!message) return;
+      const name = getChatName();
+      $chatInput.value = '';
+      $chatSend.disabled = true;
+
+      // Optimistic: show user message + thinking dots immediately
+      appendThinkingIndicator();
+      $chatMsgs.scrollTop = $chatMsgs.scrollHeight;
+
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, name }),
+        });
+        // The broadcast via SSE will deliver the full bubble — just remove thinking dots
+        removeThinkingIndicator();
+        if (!res.ok) {
+          const userWrap = document.createElement('div');
+          userWrap.className = 'chat-bubble-wrap from-user';
+          userWrap.innerHTML = `<div class="chat-bubble">${escHtml(message)}</div>`;
+          $chatMsgs.prepend(userWrap);
+        }
+      } catch {
+        removeThinkingIndicator();
+      } finally {
+        $chatSend.disabled = false;
+        $chatInput.focus();
+      }
+    }
+
+    $chatSend.addEventListener('click', sendChat);
+    $chatInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+    });
+
     // ── Process SSE event ─────────────────────────────────────────────
     function handleEvent(data) {
+      // Chat messages are broadcast as separate events
+      if (data.type === 'chat') {
+        removeThinkingIndicator();
+        appendChatBubble(data);
+        return;
+      }
+
       if (data.frame_b64) {
         $feed.src = 'data:image/jpeg;base64,' + data.frame_b64;
         $feed.style.display = 'block';

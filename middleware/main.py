@@ -2525,6 +2525,64 @@ class RemoteControlRequest(BaseModel):
 class PersonaRequest(BaseModel):
     persona: str
 
+class ChatRequest(BaseModel):
+    message: str
+    name: str = "visitor"
+
+
+# ---------------------------------------------------------------------------
+# Chat helper
+# ---------------------------------------------------------------------------
+async def _chat_response(message: str, name: str) -> str:
+    """Generate a short in-character reply grounded in the current scene."""
+    p = PERSONALITIES[state.personality_key]
+    system = p["system_prompt"]
+
+    action_desc = state.last_action if state.last_action != "stop" else "stopped"
+    scene = state.last_scene_observation or "an unclear scene"
+    dist = f"{state.last_distance_cm:.0f} cm" if state.last_distance_cm < 900 else "open space"
+
+    prompt = (
+        f"You are {p['name']} — a robot currently {action_desc}ing.\n"
+        f"What you can see right now: {scene}\n"
+        f"Distance ahead: {dist}.\n"
+        f"Your last thought: {state.last_thought}\n\n"
+        f"{name} says to you: \"{message}\"\n\n"
+        f"Reply in character as {p['name']} in at most 3 sentences. "
+        f"Be aware of your surroundings. Do not output JSON or motor commands."
+    )
+
+    if PROVIDER == "gemini":
+        loop = asyncio.get_running_loop()
+        gc = genai.Client(api_key=GEMINI_API_KEY)
+        resp = await loop.run_in_executor(
+            None,
+            lambda: gc.models.generate_content(
+                model=ACTIVE_MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.8,
+                    max_output_tokens=180,
+                ),
+            ),
+        )
+        return resp.text.strip()
+    else:
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": ACTIVE_MODEL,
+                    "system": system,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"num_predict": 120, "temperature": 0.8},
+                },
+                timeout=20.0,
+            )
+            return resp.json().get("response", "").strip()
+
 
 # ---------------------------------------------------------------------------
 # FastAPI routes
@@ -2648,6 +2706,32 @@ async def queue_status() -> JSONResponse:
             for i, s in enumerate(_control_queue)
         ]
     return JSONResponse({"queue": entries, "budget_sec": CONTROL_BUDGET_SEC})
+
+
+@app.post("/chat")
+async def chat_endpoint(req: ChatRequest) -> JSONResponse:
+    message = req.message.strip()[:400]
+    name = req.name.strip()[:32] or "visitor"
+    if not message:
+        return JSONResponse({"error": "empty message"}, status_code=400)
+    try:
+        response = await _chat_response(message, name)
+    except Exception as exc:
+        log.warning("💬 [CHAT] Error generating response: %s", _exc_summary(exc))
+        return JSONResponse({"error": "chat unavailable"}, status_code=503)
+    p = PERSONALITIES[state.personality_key]
+    log.info("💬 [CHAT] %s: '%s' → %.80s", name, message, response)
+    broadcast({
+        "type": "chat",
+        "from": name,
+        "message": message,
+        "response": response,
+        "personality": state.personality_key,
+        "p_emoji": p["emoji"],
+        "p_name": p["name"],
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
+    return JSONResponse({"response": response, "personality": state.personality_key})
 
 
 @app.get("/snapshot")
