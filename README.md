@@ -316,30 +316,34 @@ The switch is applied on the next loop cycle: planner doctrine and VLM system pr
 
 Responses are context-aware — the persona references the current scene and its recent observations. Rate-limited to 5 requests per minute (returns 429 with `retry_after_sec` on exceed). Chat uses text-only VLM calls, separate from the main scene-analysis loop.
 
+### Snapshot API
+
+| Endpoint | Description |
+|---|---|
+| `GET /snapshot` | Returns the last captured camera frame as JPEG (503 if no frame yet) |
+
 ## Runtime Telemetry / Health
 
 ### Dashboard
 
 Default: [http://localhost:8000](http://localhost:8000)
 
-Features: live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay, in-character chat.
+Features: live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay, in-character chat, voice toggle (TTS), connection status indicator, cycle/action badges.
 
 ### `GET /health` (middleware)
 
-Includes high-value runtime state:
+Returns runtime state including:
 
-- `strategy_source`
-- `strategy_mode`
-- `strategy_degraded_level`
-- `strategy_age_sec`
-- `semantic_confidence`
-- `semantic_pending_hard`
-- `semantic_pending_blocked`
-- `vlm_timeout_count`
-- `vlm_disabled_remaining_sec`
-- scene fields (`scene_frontier`, `scene_traversability`, `scene_novelty`, `scene_hazard`)
-- command authority fields (`command_id`, `command_source`, `command_mode`)
-- remote control fields (`remote_controller`, `remote_queue_length`, `remote_remaining_s`, `remote_is_active`)
+- **Core**: `status`, `personality`, `personality_name`, `cycle_count`, `hard_stops`, `last_action`, `last_thought`, `is_running`, `wheelson_ip`
+- **Telemetry**: `last_distance_cm`, `last_nav_state`
+- **Motion scoring**: `visual_stall_count`, `visual_stall_samples`, `no_progress_count`, `no_progress_samples`, `low_motion_streak`, `last_motion_score`
+- **Recovery**: `recovery_level`, `recovery_cooldown_cycles`
+- **Speed cap**: `speed_cap_level`, `speed_cap_reason`
+- **Strategy**: `strategy_source`, `strategy_mode`, `strategy_degraded_level`, `strategy_age_sec`
+- **Semantic contract**: `semantic_confidence`, `semantic_pending_hard`, `semantic_pending_blocked`
+- **VLM status**: `vlm_timeout_count`, `vlm_disabled_remaining_sec`
+- **Scene fields**: `scene_frontier`, `scene_traversability`, `scene_novelty`, `scene_hazard`
+- **Command authority**: `command_id`, `command_source`, `command_mode`
 
 ## How Persona Interacts with VLM Now
 
