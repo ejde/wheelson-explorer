@@ -14,6 +14,7 @@ import httpx
 
 from state import state
 from scene import _as_bool, _safe_int
+import config
 from config import (
     WHEELSON_IP,
     MOVE_ACTIONS,
@@ -95,6 +96,8 @@ class WheelsonClient:
         return resp.content, telemetry
 
     async def _post_move(self, payload: dict, timeout: float = 10.0) -> dict:
+        payload = dict(payload)
+        payload["visual_safety"] = "true" if config.FIRMWARE_VISUAL_SAFETY else "false"
         resp = await self.http.post(f"http://{WHEELSON_IP}/move", json=payload, timeout=timeout)
         if resp.status_code == 409:
             return {
@@ -403,6 +406,7 @@ class MotionSupervisor:
                 result = await self._post_timed_locked(action, duration, source=source, mode=level)
                 if result.safety:
                     break
+                await asyncio.sleep(duration / 1000.0)
             return result
 
     async def sync_headlight(self, on: bool, *, source: str) -> None:

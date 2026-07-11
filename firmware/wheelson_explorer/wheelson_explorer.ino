@@ -95,6 +95,9 @@ String activeCommandMode = "idle";
 bool safetyStopLatched = false;
 String safetyStopReason = "";
 
+// Dynamic visual safety configuration
+bool visualObstacleSafetyEnabled = true;
+
 // Motor IDs (from Wheelson-Library/src/Pins.hpp)
 #define MOTOR_FL 0 // Front-Left
 #define MOTOR_BL 1 // Back-Left
@@ -571,6 +574,13 @@ void handleMove() {
   if (mode.length() > 0)
     activeCommandMode = mode;
 
+  String visSafety = extractJsonString(body, "visual_safety");
+  if (visSafety == "false") {
+    visualObstacleSafetyEnabled = false;
+  } else if (visSafety == "true") {
+    visualObstacleSafetyEnabled = true;
+  }
+
   String safetyReason = safetyStopReason;
   bool safety_fired = safetyStopLatched;
   if (safetyReason.length() == 0) {
@@ -820,7 +830,7 @@ void loop() {
     }
 
     // Reactive hard-stop: if cruising forward and vision detects obstacle
-    if (navState == NAV_CRUISE && currentMoveAction == "forward" &&
+    if (visualObstacleSafetyEnabled && navState == NAV_CRUISE && currentMoveAction == "forward" &&
         telemetryObstructed) {
       stopMotors();
       currentMoveAction = "stop";

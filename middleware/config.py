@@ -13,12 +13,13 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 WHEELSON_IP = os.getenv("WHEELSON_IP", "192.168.1.100")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SEC", "1.2"))
+LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SEC", "0.4"))
 PORT = int(os.getenv("PORT", "8000"))
 GEMINI_MODEL = "gemini-2.5-flash"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = "llava"
 MAX_LOG_SIZE = 20
+FIRMWARE_VISUAL_SAFETY = os.getenv("FIRMWARE_VISUAL_SAFETY", "False").lower() == "true"
 
 GEMINI_RPM_LIMIT = 5
 GEMINI_MIN_INTERVAL = 60.0 / GEMINI_RPM_LIMIT

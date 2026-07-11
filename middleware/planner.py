@@ -39,6 +39,7 @@ class IntentPlanner:
         self.zog_freeze_cooldown = 0
         self._latched_plan: MotionPlan | None = None
         self._latched_until_ts = 0.0
+        self._forward_start_ts = 0.0
 
     def set_persona(self, persona: str) -> None:
         self.persona = persona
@@ -55,6 +56,7 @@ class IntentPlanner:
         self.zog_freeze_cooldown = 0
         self._latched_plan = None
         self._latched_until_ts = 0.0
+        self._forward_start_ts = 0.0
 
     def _base_speed(self) -> str:
         return str(self.policy.get("base_speed", "medium"))
@@ -71,7 +73,7 @@ class IntentPlanner:
         self._last_probe_turn = "right" if self._last_probe_turn == "left" else "left"
         return self._last_probe_turn
 
-    def _register_action(self, action: str) -> None:
+    def _register_action(self, action: str, now_ts: float) -> None:
         if action in {"left", "right"}:
             if action == self.last_selected_action:
                 self.same_turn_streak += 1
@@ -88,11 +90,19 @@ class IntentPlanner:
             self.stop_streak = 0
 
         if action == "forward":
+            if self.last_selected_action != "forward":
+                self._forward_start_ts = now_ts
             self.forward_chain_streak += 1
         else:
             self.forward_chain_streak = 0
+            self._forward_start_ts = 0.0
 
         self.last_selected_action = action
+
+    def _forward_duration(self, now_ts: float) -> float:
+        if self.last_selected_action == "forward" and self._forward_start_ts > 0.0:
+            return now_ts - self._forward_start_ts
+        return 0.0
 
     def _can_interrupt_latch(self, intent: StrategyIntent, telemetry: dict) -> bool:
         if bool(telemetry.get("strategy_timeout_event", False)):
@@ -218,8 +228,9 @@ class IntentPlanner:
 
         return speed, ",".join(reasons) if reasons else "none"
 
-    def _plan_benson(self, intent: StrategyIntent, telemetry: dict, speed_level: str) -> MotionPlan:
+    def _plan_benson(self, intent: StrategyIntent, telemetry: dict, speed_level: str, now_ts: float) -> MotionPlan:
         turn_ms = min(TURN_DURATION_MS.get(self.persona, 550), 650)
+        forward_dur = self._forward_duration(now_ts)
 
         if intent.hazard == "hard" or intent.frontier == "blocked":
             if bool(telemetry.get("visual_obstacle", False)):
@@ -229,10 +240,10 @@ class IntentPlanner:
         if intent.hazard == "soft" or intent.traversability == "low":
             return MotionPlan(self._open_turn(telemetry), turn_ms, "slow", "turn", "benson:risk_turn")
 
-        if self.forward_chain_streak >= 8:
+        if forward_dur >= 9.6:
             return MotionPlan("stop", 0, "slow", "hold", "benson:safety_pause")
 
-        if bool(telemetry.get("strategy_degraded", False)) and self.forward_chain_streak >= 2:
+        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= 2.4:
             return MotionPlan("stop", 0, "slow", "hold", "benson:verify_pause")
 
         if intent.frontier in {"left", "right"}:
@@ -247,21 +258,22 @@ class IntentPlanner:
             self.david_turn_bias = "right" if self.david_turn_bias == "left" else "left"
         return self.david_turn_bias
 
-    def _plan_sir_david(self, intent: StrategyIntent, telemetry: dict, speed_level: str) -> MotionPlan:
+    def _plan_sir_david(self, intent: StrategyIntent, telemetry: dict, speed_level: str, now_ts: float) -> MotionPlan:
         turn_ms = max(TURN_DURATION_MS.get(self.persona, 500), 520)
+        forward_dur = self._forward_duration(now_ts)
 
         if intent.hazard == "hard":
             return MotionPlan(self._open_turn(telemetry), turn_ms, "slow", "turn", "sirdavid:careful_reroute")
 
-        if bool(telemetry.get("strategy_degraded", False)) and self.forward_chain_streak >= 1:
+        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= 1.2:
             return MotionPlan(self._next_david_turn(), turn_ms, "slow", "turn", "sirdavid:listen_scan")
 
         if intent.novelty == "high" and intent.hazard == "none":
-            if self.forward_chain_streak >= 2:
+            if forward_dur >= 2.4:
                 return MotionPlan(self._next_david_turn(), turn_ms, speed_level, "turn", "sirdavid:reframe_subject")
             return MotionPlan("forward", 0, speed_level, "explore", "sirdavid:approach_novelty")
 
-        if self.forward_chain_streak >= 3:
+        if forward_dur >= 3.6:
             hint = intent.frontier if intent.frontier in {"left", "right"} else None
             return MotionPlan(self._next_david_turn(hint), turn_ms, speed_level, "turn", "sirdavid:wander_arc")
 
@@ -270,7 +282,7 @@ class IntentPlanner:
 
         return MotionPlan("forward", 0, speed_level, "explore", "sirdavid:gentle_explore")
 
-    def _plan_klaus(self, intent: StrategyIntent, telemetry: dict, speed_level: str, cycle_count: int) -> MotionPlan:
+    def _plan_klaus(self, intent: StrategyIntent, telemetry: dict, speed_level: str, cycle_count: int, now_ts: float) -> MotionPlan:
         preferred = str(self.policy.get("preferred_wall", "left"))
         if preferred not in {"left", "right"}:
             preferred = "left"
@@ -278,6 +290,7 @@ class IntentPlanner:
         preferred_turn: Literal["left", "right"] = "left" if preferred == "left" else "right"
         wall_signal = telemetry.get("obstacle_left_ratio", 0.0) if preferred == "left" else telemetry.get("obstacle_right_ratio", 0.0)
         wide_turn_ms = max(TURN_DURATION_MS.get(self.persona, 700), KLAUS_ARC_TURN_MS)
+        forward_dur = self._forward_duration(now_ts)
 
         if intent.hazard == "hard" or intent.frontier == "blocked":
             if bool(telemetry.get("visual_obstacle", False)):
@@ -294,18 +307,18 @@ class IntentPlanner:
         if wall_signal > 0.72:
             return MotionPlan(opposite, 620, speed_level, "turn", "klaus:clearance_correction")
 
-        if self.forward_chain_streak >= KLAUS_ARC_INTERVAL:
+        if forward_dur >= (KLAUS_ARC_INTERVAL * 1.2):
             arc_turn: Literal["left", "right"] = preferred_turn
             if cycle_count % 5 == 0:
                 arc_turn = opposite
             return MotionPlan(arc_turn, wide_turn_ms, speed_level, "turn", "klaus:signature_arc")
 
-        if bool(telemetry.get("strategy_degraded", False)) and self.forward_chain_streak >= 1:
+        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= 1.2:
             return MotionPlan(preferred_turn, wide_turn_ms, "slow", "turn", "klaus:scan_perimeter")
 
         return MotionPlan("forward", 0, speed_level, "explore", "klaus:perimeter_sweep")
 
-    def _plan_zog7(self, intent: StrategyIntent, telemetry: dict, speed_level: str) -> MotionPlan:
+    def _plan_zog7(self, intent: StrategyIntent, telemetry: dict, speed_level: str, now_ts: float) -> MotionPlan:
         preferred = str(self.policy.get("preferred_wall", "right"))
         if preferred not in {"left", "right"}:
             preferred = "right"
@@ -313,6 +326,7 @@ class IntentPlanner:
         opposite: Literal["left", "right"] = "left" if preferred == "right" else "right"
         wall_signal = telemetry.get("obstacle_right_ratio", 0.0) if preferred == "right" else telemetry.get("obstacle_left_ratio", 0.0)
         light = str(telemetry.get("brightness", "Normal"))
+        forward_dur = self._forward_duration(now_ts)
 
         if light == "Bright" and intent.hazard == "none":
             self.zog_freeze_cooldown = 2
@@ -332,7 +346,7 @@ class IntentPlanner:
         if wall_signal > 0.70:
             return MotionPlan(opposite, 520, speed_level, "turn", "zog7:standoff_adjust")
 
-        if self.forward_chain_streak >= 3:
+        if forward_dur >= 3.6:
             return MotionPlan("stop", 0, "slow", "hold", "zog7:listen_pause")
 
         return MotionPlan("forward", 0, speed_level, "explore", "zog7:shadow_run")
@@ -343,7 +357,7 @@ class IntentPlanner:
             and now_ts < self._latched_until_ts
             and not self._can_interrupt_latch(intent, telemetry)
         ):
-            self._register_action(self._latched_plan.action)
+            self._register_action(self._latched_plan.action, now_ts)
             return MotionPlan(
                 action=self._latched_plan.action,
                 duration_ms=self._latched_plan.duration_ms,
@@ -358,22 +372,22 @@ class IntentPlanner:
         if timeout_plan:
             self._latched_plan = None
             self._latched_until_ts = 0.0
-            self._register_action(timeout_plan.action)
+            self._register_action(timeout_plan.action, now_ts)
             timeout_plan.reason = f"{timeout_plan.reason}|{speed_reason}"
             return timeout_plan
 
         if self.persona == "benson":
-            plan = self._plan_benson(intent, telemetry, speed_level)
+            plan = self._plan_benson(intent, telemetry, speed_level, now_ts)
         elif self.persona == "sir_david":
-            plan = self._plan_sir_david(intent, telemetry, speed_level)
+            plan = self._plan_sir_david(intent, telemetry, speed_level, now_ts)
         elif self.persona == "klaus":
-            plan = self._plan_klaus(intent, telemetry, speed_level, cycle_count)
+            plan = self._plan_klaus(intent, telemetry, speed_level, cycle_count, now_ts)
         elif self.persona == "zog7":
-            plan = self._plan_zog7(intent, telemetry, speed_level)
+            plan = self._plan_zog7(intent, telemetry, speed_level, now_ts)
         else:
             plan = MotionPlan("forward", 0, speed_level, "explore", "default:advance")
 
-        self._register_action(plan.action)
+        self._register_action(plan.action, now_ts)
         self._latch_plan(plan, now_ts)
         plan.reason = f"{plan.reason}|{speed_reason}"
         return plan

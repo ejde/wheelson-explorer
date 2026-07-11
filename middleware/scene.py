@@ -405,6 +405,7 @@ def _reconcile_scene_with_telemetry(
     traversability: SceneLevel,
     hazard: HazardLevel,
     telemetry: dict,
+    source: str = "local",
 ) -> tuple[SceneFrontier, SceneLevel, HazardLevel]:
     visual_obstacle = bool(telemetry.get("visual_obstacle", False))
     side_left = telemetry.get("obstacle_left_ratio", 0.0)
@@ -436,14 +437,16 @@ def _reconcile_scene_with_telemetry(
             hazard = "none"
 
     # Conversely, hard visual obstacle should not keep "none" hazard.
-    if visual_obstacle and hazard == "none":
-        hazard = "soft"
-        if traversability == "high":
-            traversability = "medium"
-        if frontier == "forward":
-            frontier = "blocked"
-    if visual_obstacle and side_peak >= 0.35 and hazard == "soft":
-        hazard = "hard"
+    # We only apply this fallback safety override if the assessment source is local (not VLM).
+    if source != "vlm":
+        if visual_obstacle and hazard == "none":
+            hazard = "soft"
+            if traversability == "high":
+                traversability = "medium"
+            if frontier == "forward":
+                frontier = "blocked"
+        if visual_obstacle and side_peak >= 0.35 and hazard == "soft":
+            hazard = "hard"
 
     return frontier, traversability, hazard
 
@@ -556,6 +559,7 @@ def build_strategy_intent(vlm: dict, telemetry: dict, source: str, personality_k
         traversability,
         hazard,
         telemetry,
+        source=source,
     )
 
     objective = _compose_objective(personality_key, frontier, traversability, novelty, hazard)
