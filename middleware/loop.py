@@ -25,6 +25,7 @@ from config import (
     LOOP_INTERVAL,
     PORT,
     MAX_LOG_SIZE,
+    FAILSAFE_BACKOFF_SEC,
     GEMINI_MIN_INTERVAL,
     OLLAMA_STRATEGY_MIN_INTERVAL,
     OLLAMA_VLM_TIMEOUT_SEC,
@@ -46,7 +47,6 @@ from scene import (
     _exc_summary,
     _is_vlm_quota_error,
     _is_placeholder_text,
-    flip_jpeg,
     _frame_signature,
     _motion_score,
     _persona_reactive_thought,
@@ -233,8 +233,9 @@ async def explorer_loop() -> None:
                 cycle_start = loop.time()
                 try:
                     jpeg_bytes, telemetry = await wheelson.fetch_frame()
-                    jpeg_bytes = flip_jpeg(jpeg_bytes)
-                    state.last_frame_b64 = base64.b64encode(jpeg_bytes).decode()
+                    # The camera is mounted upside down; the dashboard rotates
+                    # the image with CSS so no CPU-bound PIL flip on this path.
+                    state.last_frame_b64 = (await asyncio.to_thread(base64.b64encode, jpeg_bytes)).decode()
 
                     state.last_distance_cm = telemetry["distance_cm"]
                     state.last_nav_state = telemetry.get("nav_state", "UNKNOWN")
@@ -485,18 +486,21 @@ async def explorer_loop() -> None:
                         # -- S2-S3: Recovery FSM / Autonomous Planner --
                         if _remote_was_active:
                             _remote_was_active = False
+                            # Halt any residual remote motion before autonomy resumes.
+                            await motion.stop_now(source="remote_release", mode="manual")
                             log.info("\U0001f916 [REMOTE] Autonomy resumed after '%s'", state.remote_controller_name)
 
                         trigger: RecoveryTrigger | None = None
                         if not strategy_timeout_event:
                             tracking_forward = (
                                 state.last_action == "forward"
-                                or motion.active_continuous_action == "forward"
+                                or motion.active_continuous_action in ("forward", "drive")
                             )
                             trigger = recovery.observe(
                                 tracking_forward=tracking_forward,
                                 motion_score=motion_score,
                                 telemetry=telemetry,
+                                now_ts=now_ts,
                             )
 
                         plan_speed = "medium"
@@ -540,9 +544,11 @@ async def explorer_loop() -> None:
                         state.hard_stop_count += 1
                         recovery.reset()
 
-                    if actual_action == state.last_action:
+                    # Streak counts distinct motion commands, not latch repeats.
+                    new_command_id = result.command_id or ""
+                    if actual_action == state.last_action and new_command_id != state.last_command_id:
                         state.action_streak += 1
-                    else:
+                    elif actual_action != state.last_action:
                         state.action_streak = 1
 
                     state.last_action = actual_action
@@ -553,13 +559,14 @@ async def explorer_loop() -> None:
                     state.last_command_source = result.source or state.last_command_source
                     state.last_command_mode = result.mode or state.last_command_mode
 
-                    state.visual_stall_count = recovery.low_motion_streak
-                    state.visual_stall_samples = recovery.low_motion_streak
-                    state.no_progress_count = recovery.low_motion_streak
-                    state.no_progress_samples = recovery.low_motion_streak
+                    _streak_int = int(round(recovery.low_motion_streak))
+                    state.visual_stall_count = _streak_int
+                    state.visual_stall_samples = _streak_int
+                    state.no_progress_count = _streak_int
+                    state.no_progress_samples = _streak_int
                     state.recovery_level = recovery.escalation_level
-                    state.recovery_cooldown_cycles = recovery.cooldown_cycles
-                    state.low_motion_streak = recovery.low_motion_streak
+                    state.recovery_cooldown_cycles = int(round(recovery.cooldown_cycles))
+                    state.low_motion_streak = _streak_int
                     state.speed_cap_level = plan_speed
                     state.speed_cap_reason = plan_reason
 
@@ -639,7 +646,10 @@ async def explorer_loop() -> None:
                         state.last_nav_state,
                         actual_action,
                         actual_duration,
-                        motion.active_continuous_action if motion.active_continuous_action in MOVE_ACTIONS else "off",
+                        motion.active_continuous_action
+                        if motion.active_continuous_action in MOVE_ACTIONS
+                        or motion.active_continuous_action == "drive"
+                        else "off",
                         state.last_distance_cm,
                         motion_score,
                         state.low_motion_streak,
@@ -668,12 +678,15 @@ async def explorer_loop() -> None:
                 except httpx.RequestError as exc:
                     log.error("\U0001f4e1 [NETWORK] Cannot reach Wheelson at %s: %s", _config_module.WHEELSON_IP, exc)
                     await stop_with_failsafe("network error while robot may be moving")
+                    await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
                 except VLMResponseError as exc:
                     log.error("\U0001f916 [VLM] %s raw='%.200s'", exc, exc.raw.replace("\n", " "))
                     await stop_with_failsafe("invalid VLM response")
+                    await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
                 except Exception as exc:
                     log.error("\U0001f4a5 [LOOP] Unexpected error: %s", exc, exc_info=True)
                     await stop_with_failsafe("unexpected middleware loop error")
+                    await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
 
                 elapsed = loop.time() - cycle_start
                 await asyncio.sleep(max(0.0, LOOP_INTERVAL - elapsed))

@@ -41,7 +41,7 @@ Each layer can suppress the layers below it. **All motor commands go through a s
 | Layer | What it does |
 |---|---|
 | **S0 Firmware Safety** | Lease-timeout hard stop; visual-obstacle latch. Always active. |
-| **S1 Motion Authority** | `MotionSupervisor` — asyncio-locked single writer to `/move`, heartbeat renewal for continuous motion, command ID propagation. |
+| **S1 Motion Authority** | `MotionSupervisor` — asyncio-locked single writer to `/move` (lock never held across sleeps), generation-tagged heartbeat snapshot renewal for continuous motion (including differential `drive` arcs), command ID propagation. |
 | **S2 Recovery FSM** | `RecoveryController` — deterministic nudge → escape → hard-escape escalation triggered by motion-score stall detection. |
 | **S3 Persona Strategist** | `IntentPlanner` — per-persona motion doctrine. Switchable live via `POST /persona`. |
 | **S4 VLM Semantic Interpreter** | Async advisory only. Outputs scene fields (`frontier`, `traversability`, `novelty`, `hazard`) + persona `commentary`. **Never issues motor commands.** |
@@ -78,7 +78,7 @@ The VLM is non-blocking and non-authoritative for motion:
 
 ### Remote Control & Persona Switching
 
-- `POST /queue/join` issues a token. `POST /control {token, direction}` calls `MotionSupervisor.remote_move()` with a 600 ms timed command — repeated by the frontend at ~350 ms while a key is held.
+- `POST /queue/join` issues a token. `POST /control {token, direction}` calls `MotionSupervisor.remote_move()` — directional commands run as continuous motion renewed by the heartbeat while fresh commands keep arriving (`REMOTE_RENEWAL_WINDOW_SEC`, 0.7 s); after the last command the firmware lease timeout halts the robot.
 - After `CONTROL_INACTIVITY_SEC` (3 s) of no commands, `state.remote_is_active` becomes false and autonomy resumes; the session stays in queue until budget (`CONTROL_BUDGET_SEC`, 60 s) expires or the user calls `POST /queue/leave`.
 - `POST /persona` sets `state.pending_persona`; consumed by the loop on the next cycle.
 - Queue/controller state is broadcast each SSE cycle: `remote_controller`, `remote_queue_length`, `remote_remaining_s`, `remote_is_active`.

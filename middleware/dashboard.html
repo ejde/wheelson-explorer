@@ -147,6 +147,8 @@
       object-fit: contain;
       image-rendering: pixelated;
       filter: brightness(.95) contrast(1.05) saturate(1.1);
+      /* Camera is mounted upside down; rotate here instead of in the loop. */
+      transform: rotate(180deg);
     }
 
     .camera-overlay {

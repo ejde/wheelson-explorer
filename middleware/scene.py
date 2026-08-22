@@ -104,12 +104,9 @@ def _is_placeholder_text(value: str) -> bool:
 # ---------------------------------------------------------------------------
 # Image helpers
 # ---------------------------------------------------------------------------
-def flip_jpeg(jpeg_bytes: bytes) -> bytes:
-    img = Image.open(io.BytesIO(jpeg_bytes)).rotate(180)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
-
+# NOTE: flip_jpeg was removed — the dashboard rotates the feed with CSS so the
+# per-cycle PIL decode/rotate/re-encode no longer sits on the control loop's
+# critical path.
 
 def _frame_signature(jpeg_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(jpeg_bytes)).convert("L").resize((32, 24))

@@ -21,6 +21,7 @@ from config import (
     ALL_ACTIONS,
     LEASE_HEARTBEAT_SEC,
     LEASE_MISSED_LIMIT,
+    REMOTE_RENEWAL_WINDOW_SEC,
     SIDE_STEER_TURN_MS,
     ESCAPE_BACKWARD_MS,
     ESCAPE_TURN_MS,
@@ -29,6 +30,13 @@ from config import (
 )
 
 log = logging.getLogger("wheelson")
+
+# Base wheel intensity per speed level (mirrors firmware SPEED_* constants).
+SPEED_BASE_INTENSITY = {"slow": 25, "medium": 40, "fast": 55}
+
+
+def _clamp_int8(value: float) -> int:
+    return max(-127, min(127, int(value)))
 
 
 @dataclass
@@ -49,6 +57,7 @@ class MotionPlan:
     speed_level: str
     mode: str
     reason: str
+    steer: float = 0.0  # -1..1, >0 veers left; used with continuous forward plans
 
 
 class WheelsonClient:
@@ -168,6 +177,28 @@ class WheelsonClient:
             timeout=10.0,
         )
 
+    async def drive(
+        self,
+        left: int,
+        right: int,
+        *,
+        command_id: str,
+        source: str,
+        mode: str,
+    ) -> dict:
+        """Differential drive: signed wheel intensities, lease-renewed like move_indefinitely."""
+        return await self._post_move(
+            {
+                "command": "drive",
+                "left": _clamp_int8(left),
+                "right": _clamp_int8(right),
+                "command_id": command_id,
+                "source": source,
+                "mode": mode,
+            },
+            timeout=10.0,
+        )
+
     async def move_timed(
         self,
         action: str,
@@ -203,12 +234,22 @@ class WheelsonClient:
 class MotionSupervisor:
     def __init__(self, client: WheelsonClient):
         self.client = client
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # serializes actuator commands (never held across sleeps)
         self._current_speed: str | None = None
         self._active_continuous_action: str = "stop"
         self._active_mode: str = "idle"
         self._active_source: str = "bootstrap"
         self._last_command_id: str = "boot"
+
+        # Heartbeat snapshot: plain fields the heartbeat task reads WITHOUT the
+        # main lock. Guarded by _mu and bumped via _gen so stale renewals can be
+        # detected and rolled back after the network call returns.
+        self._mu = asyncio.Lock()
+        self._gen = 0
+        self._hb_action: str = "stop"
+        self._hb_mode: str = "idle"
+        self._hb_source: str = "bootstrap"
+        self._hb_drive: tuple[int, int] | None = None
 
         self._seq = 0
         self._session = datetime.now().strftime("%H%M%S")
@@ -217,6 +258,7 @@ class MotionSupervisor:
         self._heartbeat_task: asyncio.Task | None = None
         self._missed_lease_count = 0
         self._heartbeat_safety_event = False
+        self._last_remote_command_ts: float = 0.0
 
     @property
     def active_continuous_action(self) -> str:
@@ -266,6 +308,19 @@ class MotionSupervisor:
         self._current_speed = level
         self._last_command_id = str(payload.get("command_id", command_id))
 
+    async def _publish_hb(self, action: str, mode: str, source: str, drive: tuple[int, int] | None = None) -> None:
+        """Update heartbeat snapshot. Call while holding self._lock (or _mu)."""
+        async with self._mu:
+            self._gen += 1
+            self._hb_action = action
+            self._hb_mode = mode
+            self._hb_source = source
+            self._hb_drive = drive
+
+    async def _hb_snapshot(self) -> tuple[int, str, str, str, tuple[int, int] | None]:
+        async with self._mu:
+            return self._gen, self._hb_action, self._hb_mode, self._hb_source, self._hb_drive
+
     def _result_from_payload(
         self,
         payload: dict,
@@ -302,6 +357,7 @@ class MotionSupervisor:
         self._active_continuous_action = "stop"
         self._active_mode = "idle"
         self._active_source = source
+        await self._publish_hb("stop", "idle", source, None)
         return self._result_from_payload(
             payload,
             fallback_action="stop",
@@ -352,10 +408,42 @@ class MotionSupervisor:
             self._active_continuous_action = result.action
             self._active_mode = mode
             self._active_source = source
+            await self._publish_hb(result.action, mode, source, None)
         else:
             self._active_continuous_action = "stop"
             self._active_mode = "idle"
             self._active_source = source
+            await self._publish_hb("stop", "idle", source, None)
+        return result
+
+    async def _post_drive_locked(
+        self, left: int, right: int, *, source: str, mode: str
+    ) -> MotionResult:
+        """Continuous differential drive; renewed by the heartbeat like move_indefinitely."""
+        left = _clamp_int8(left)
+        right = _clamp_int8(right)
+        command_id = self._next_command_id(source)
+        payload = await self.client.drive(
+            left, right, command_id=command_id, source=source, mode=mode
+        )
+        result = self._result_from_payload(
+            payload,
+            fallback_action="forward" if (left > 0 and right > 0) else "stop",
+            fallback_duration_ms=0,
+            fallback_command_id=command_id,
+            source=source,
+            mode=mode,
+        )
+        if not result.busy and not result.safety and (left != 0 or right != 0):
+            self._active_continuous_action = "drive"
+            self._active_mode = mode
+            self._active_source = source
+            await self._publish_hb("drive", mode, source, (left, right))
+        else:
+            self._active_continuous_action = "stop"
+            self._active_mode = "idle"
+            self._active_source = source
+            await self._publish_hb("stop", "idle", source, None)
         return result
 
     async def apply_plan(self, plan: MotionPlan, *, source: str) -> MotionResult:
@@ -370,6 +458,13 @@ class MotionSupervisor:
                     source=source,
                     mode=plan.mode,
                 )
+            if abs(plan.steer) >= 0.01 and plan.action == "forward":
+                # Proportional arc: differential wheel intensities instead of
+                # bang-bang forward. Renewed by heartbeat via drive snapshot.
+                base = SPEED_BASE_INTENSITY.get(plan.speed_level, 40)
+                left = _clamp_int8(base * (1.0 - plan.steer))
+                right = _clamp_int8(base * (1.0 + plan.steer))
+                return await self._post_drive_locked(left, right, source=source, mode=plan.mode)
             return await self._post_continuous_locked(plan.action, source=source, mode=plan.mode)
 
     async def execute_recovery(
@@ -380,34 +475,34 @@ class MotionSupervisor:
         speed_level: str,
         source: str,
     ) -> MotionResult:
+        """Recovery sequence.
+
+        The supervisor lock is acquired per step only — never held across the
+        inter-step sleeps, so the heartbeat task (and remote control) are never
+        starved long enough to trip the firmware lease timeout.
+        """
+        steps: list[tuple[str, int]]
+        if level == "nudge":
+            steps = [(turn_direction, SIDE_STEER_TURN_MS)]
+        elif level == "escape":
+            steps = [("backward", ESCAPE_BACKWARD_MS), (turn_direction, ESCAPE_TURN_MS)]
+        else:
+            hard_turn = "right" if turn_direction == "left" else "left"
+            steps = [("backward", HARD_ESCAPE_BACKUP_MS), (hard_turn, HARD_ESCAPE_TURN_MS)]
+
         async with self._lock:
             await self._ensure_speed_locked(speed_level, source=source, mode=level)
-            await self._post_stop_locked(source=source, mode=level)
+            result = await self._post_stop_locked(source=source, mode=level)
 
-            steps: list[tuple[str, int]]
-            if level == "nudge":
-                steps = [(turn_direction, SIDE_STEER_TURN_MS)]
-            elif level == "escape":
-                steps = [("backward", ESCAPE_BACKWARD_MS), (turn_direction, ESCAPE_TURN_MS)]
-            else:
-                hard_turn = "right" if turn_direction == "left" else "left"
-                steps = [("backward", HARD_ESCAPE_BACKUP_MS), (hard_turn, HARD_ESCAPE_TURN_MS)]
-
-            result = MotionResult(
-                action="stop",
-                duration_ms=0,
-                safety=False,
-                busy=False,
-                command_id=self._last_command_id,
-                source=source,
-                mode=level,
-            )
-            for action, duration in steps:
-                result = await self._post_timed_locked(action, duration, source=source, mode=level)
-                if result.safety:
+        for action, duration in steps:
+            async with self._lock:
+                if not self._running:
                     break
-                await asyncio.sleep(duration / 1000.0)
-            return result
+                result = await self._post_timed_locked(action, duration, source=source, mode=level)
+            if result.safety:
+                break
+            await asyncio.sleep(duration / 1000.0)
+        return result
 
     async def sync_headlight(self, on: bool, *, source: str) -> None:
         async with self._lock:
@@ -425,7 +520,13 @@ class MotionSupervisor:
             return await self._post_stop_locked(source=source, mode=mode)
 
     async def remote_move(self, direction: str, duration_ms: int = 600) -> MotionResult:
-        """Execute a single remote-control command. Called directly by HTTP handler."""
+        """Execute a single remote-control command. Called directly by HTTP handler.
+
+        Directional commands use continuous motion renewed by the heartbeat while
+        fresh commands keep arriving; if commands stop, renewal ceases after
+        REMOTE_RENEWAL_WINDOW_SEC and the firmware lease timeout halts the robot.
+        """
+        self._last_remote_command_ts = asyncio.get_running_loop().time()
         # Cap speed based on current scene hazard
         speed = "medium"
         if state.last_scene_hazard == "hard" or state.last_scene_traversability == "low":
@@ -434,51 +535,99 @@ class MotionSupervisor:
             await self._ensure_speed_locked(level=speed, source="remote", mode="manual")
             if direction == "stop":
                 return await self._post_stop_locked(source="remote", mode="manual")
-            return await self._post_timed_locked(direction, duration_ms, source="remote", mode="manual")
+            return await self._post_continuous_locked(direction, source="remote", mode="manual")
 
     async def _heartbeat_loop(self) -> None:
+        """Renew the active continuous motion without holding the main actuator lock.
+
+        Reads a generation-tagged snapshot under the tiny _mu lock, performs the
+        network renewal unlocked, then verifies the generation is unchanged. If
+        another writer changed state meanwhile, any spurious renewal is rolled
+        back with an immediate stop.
+        """
         while self._running:
             await asyncio.sleep(LEASE_HEARTBEAT_SEC)
-            async with self._lock:
-                if self._active_continuous_action not in MOVE_ACTIONS:
-                    self._missed_lease_count = 0
-                    continue
+            await self._heartbeat_once()
 
-                command_id = self._next_command_id("lease")
+    async def _heartbeat_once(self) -> None:
+        gen, action, mode, source, drive_targets = await self._hb_snapshot()
+
+        if action not in MOVE_ACTIONS and action != "drive":
+            async with self._mu:
+                self._missed_lease_count = 0
+            return
+
+        # Remote teleop: only renew while commands are fresh so the robot
+        # coasts to a firmware-lease stop shortly after the last input.
+        if source == "remote" and (
+            asyncio.get_running_loop().time() - self._last_remote_command_ts
+            > REMOTE_RENEWAL_WINDOW_SEC
+        ):
+            async with self._mu:
+                self._gen += 1
+                self._hb_action = "stop"
+                self._hb_drive = None
+            return
+
+        command_id = self._next_command_id("lease")
+        try:
+            if action == "drive" and drive_targets is not None:
+                payload = await self.client.drive(
+                    drive_targets[0],
+                    drive_targets[1],
+                    command_id=command_id,
+                    source="lease",
+                    mode=mode,
+                )
+            else:
+                payload = await self.client.move_indefinitely(
+                    action,
+                    command_id=command_id,
+                    source="lease",
+                    mode=mode,
+                )
+            self._last_command_id = str(payload.get("command_id", command_id))
+
+            gen_now, _, _, _, _ = await self._hb_snapshot()
+            if gen_now != gen:
+                # State changed during renewal; undo any spurious restart.
+                with contextlib.suppress(Exception):
+                    await self.stop_now(source="lease_rollback", mode="hold")
+                return
+
+            async with self._mu:
+                self._missed_lease_count = 0
+
+            if _as_bool(payload.get("safety", False)):
+                log.warning(
+                    "\U0001f6d1 [LEASE] firmware safety override while renewing %s",
+                    action,
+                )
+                async with self._mu:
+                    self._gen += 1
+                    self._hb_action = "stop"
+                    self._hb_mode = "idle"
+                    self._hb_drive = None
+                self._active_continuous_action = "stop"
+                self._active_mode = "idle"
+                self._heartbeat_safety_event = True
+        except httpx.RequestError as exc:
+            async with self._mu:
+                self._missed_lease_count += 1
+                missed = self._missed_lease_count
+            log.warning(
+                "\U0001f4e1 [LEASE] heartbeat failed (%d/%d) action=%s err=%s",
+                missed,
+                LEASE_MISSED_LIMIT,
+                action,
+                exc,
+            )
+            if missed >= LEASE_MISSED_LIMIT:
+                log.warning("\U0001f6d1 [LEASE] missed too many heartbeats, forcing stop")
                 try:
-                    payload = await self.client.move_indefinitely(
-                        self._active_continuous_action,
-                        command_id=command_id,
-                        source="lease",
-                        mode=self._active_mode,
-                    )
-                    self._last_command_id = str(payload.get("command_id", command_id))
-                    self._missed_lease_count = 0
-
-                    if _as_bool(payload.get("safety", False)):
-                        log.warning(
-                            "\U0001f6d1 [LEASE] firmware safety override while renewing %s",
-                            self._active_continuous_action,
-                        )
-                        self._active_continuous_action = "stop"
-                        self._active_mode = "idle"
+                    await self.stop_now(source="failsafe", mode="hold")
+                except Exception as stop_exc:
+                    log.warning("\U0001f6d1 [LEASE] failsafe stop command failed: %s", stop_exc)
+                finally:
+                    async with self._mu:
                         self._heartbeat_safety_event = True
-                except httpx.RequestError as exc:
-                    self._missed_lease_count += 1
-                    log.warning(
-                        "\U0001f4e1 [LEASE] heartbeat failed (%d/%d) action=%s err=%s",
-                        self._missed_lease_count,
-                        LEASE_MISSED_LIMIT,
-                        self._active_continuous_action,
-                        exc,
-                    )
-                    if self._missed_lease_count >= LEASE_MISSED_LIMIT:
-                        log.warning("\U0001f6d1 [LEASE] missed too many heartbeats, forcing stop")
-                        try:
-                            await self._post_stop_locked(source="failsafe", mode="hold")
-                        except Exception as stop_exc:
-                            log.warning("\U0001f6d1 [LEASE] failsafe stop command failed: %s", stop_exc)
-                        finally:
-                            self._active_continuous_action = "stop"
-                            self._active_mode = "idle"
-                            self._heartbeat_safety_event = True

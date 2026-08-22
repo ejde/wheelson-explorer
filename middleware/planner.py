@@ -3,6 +3,7 @@ wheelson-explorer · middleware · planner.py
 Intent planner (tactical planning, all _plan_* methods).
 """
 
+import random
 from typing import Literal
 
 from motion import MotionPlan
@@ -20,11 +21,19 @@ from config import (
     KLAUS_ARC_INTERVAL,
     KLAUS_ARC_TURN_MS,
     STARTUP_SLOW_CYCLES,
+    STEER_GAIN,
+    STEER_DEADBAND,
+    STEER_MAX,
+    JITTER_FRACTION,
+    IDLE_GLANCE_PROBABILITY,
+    IDLE_GLANCE_MIN_INTERVAL_SEC,
+    IDLE_GLANCE_TURN_MS,
 )
 
 
 class IntentPlanner:
-    def __init__(self):
+    def __init__(self, rng_seed=None):
+        self._rng = random.Random(rng_seed)
         self.persona = "benson"
         self.policy = PERSONA_POLICIES["benson"]
         self.last_selected_action = "stop"
@@ -37,6 +46,16 @@ class IntentPlanner:
         self.klaus_wall_seek_streak = 0
         self.david_turn_bias: Literal["left", "right"] = "left"
         self.zog_freeze_cooldown = 0
+        self._zog_frozen = False
+        # Naturalness state
+        self._episode_samples: dict[str, float] = {}
+        self._last_glance_ts = -1e9
+        self._glance_side: Literal["left", "right"] = "right"
+        # Hysteresis latches
+        self._zog_bright_streak = 0
+        self._zog_clear_streak = 0
+        self._klaus_wall_acquired = False
+        self._zog_edge_acquired = False
         self._latched_plan: MotionPlan | None = None
         self._latched_until_ts = 0.0
         self._forward_start_ts = 0.0
@@ -54,9 +73,16 @@ class IntentPlanner:
         self.klaus_wall_seek_streak = 0
         self.david_turn_bias = "left"
         self.zog_freeze_cooldown = 0
+        self._zog_frozen = False
         self._latched_plan = None
         self._latched_until_ts = 0.0
         self._forward_start_ts = 0.0
+        self._episode_samples = {}
+        self._last_glance_ts = -1e9
+        self._zog_bright_streak = 0
+        self._zog_clear_streak = 0
+        self._klaus_wall_acquired = False
+        self._zog_edge_acquired = False
 
     def _base_speed(self) -> str:
         return str(self.policy.get("base_speed", "medium"))
@@ -103,6 +129,48 @@ class IntentPlanner:
         if self.last_selected_action == "forward" and self._forward_start_ts > 0.0:
             return now_ts - self._forward_start_ts
         return 0.0
+
+    # -- Naturalness helpers -------------------------------------------------
+    def _sample(self, key: str, base: float) -> float:
+        """Per-forward-episode jittered threshold (de-quantizes persona pacing)."""
+        if key not in self._episode_samples:
+            frac = self._rng.uniform(-JITTER_FRACTION, JITTER_FRACTION)
+            self._episode_samples[key] = base * (1.0 + frac)
+        return self._episode_samples[key]
+
+    def _begin_episode_if_new(self) -> None:
+        if self.last_selected_action != "forward":
+            self._episode_samples = {}
+
+    def _compute_steer(self, telemetry: dict) -> float:
+        """Positive steer veers left, away from a higher right-side obstacle ratio."""
+        left_r = float(telemetry.get("obstacle_left_ratio", 0.0))
+        right_r = float(telemetry.get("obstacle_right_ratio", 0.0))
+        raw = STEER_GAIN * (right_r - left_r)
+        raw = max(-STEER_MAX, min(STEER_MAX, raw))
+        if abs(raw) < STEER_DEADBAND:
+            return 0.0
+        return raw
+
+    def _maybe_idle_glance(self, plan: MotionPlan, now_ts: float) -> MotionPlan:
+        """Replace some long holds with brief orienting glances so stillness
+        reads as attentive rather than frozen."""
+        if plan.action != "stop" or plan.mode != "hold":
+            return plan
+        if (now_ts - self._last_glance_ts) < IDLE_GLANCE_MIN_INTERVAL_SEC:
+            return plan
+        if self._rng.random() >= IDLE_GLANCE_PROBABILITY:
+            return plan
+        self._last_glance_ts = now_ts
+        self._glance_side = "left" if self._glance_side == "right" else "right"
+        return MotionPlan(
+            action=self._glance_side,
+            duration_ms=IDLE_GLANCE_TURN_MS,
+            speed_level="slow",
+            mode="turn",
+            reason="idle:glance",
+        )
+
 
     def _can_interrupt_latch(self, intent: StrategyIntent, telemetry: dict) -> bool:
         if bool(telemetry.get("strategy_timeout_event", False)):
@@ -240,10 +308,10 @@ class IntentPlanner:
         if intent.hazard == "soft" or intent.traversability == "low":
             return MotionPlan(self._open_turn(telemetry), turn_ms, "slow", "turn", "benson:risk_turn")
 
-        if forward_dur >= 9.6:
+        if forward_dur >= self._sample("pause_limit", 9.6):
             return MotionPlan("stop", 0, "slow", "hold", "benson:safety_pause")
 
-        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= 2.4:
+        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= self._sample("verify_pause", 2.4):
             return MotionPlan("stop", 0, "slow", "hold", "benson:verify_pause")
 
         if intent.frontier in {"left", "right"}:
@@ -269,11 +337,11 @@ class IntentPlanner:
             return MotionPlan(self._next_david_turn(), turn_ms, "slow", "turn", "sirdavid:listen_scan")
 
         if intent.novelty == "high" and intent.hazard == "none":
-            if forward_dur >= 2.4:
+            if forward_dur >= self._sample("reframe", 2.4):
                 return MotionPlan(self._next_david_turn(), turn_ms, speed_level, "turn", "sirdavid:reframe_subject")
             return MotionPlan("forward", 0, speed_level, "explore", "sirdavid:approach_novelty")
 
-        if forward_dur >= 3.6:
+        if forward_dur >= self._sample("wander_arc", 3.6):
             hint = intent.frontier if intent.frontier in {"left", "right"} else None
             return MotionPlan(self._next_david_turn(hint), turn_ms, speed_level, "turn", "sirdavid:wander_arc")
 
@@ -297,17 +365,24 @@ class IntentPlanner:
                 return MotionPlan("backward", ESCAPE_BACKWARD_MS, "slow", "reverse", "klaus:clearance_reset")
             return MotionPlan(opposite, wide_turn_ms, "slow", "turn", "klaus:detour_arc")
 
-        if wall_signal < 0.08:
+        # Wall-following hysteresis: once acquired, keep following until the
+        # wall signal drops well below the acquisition threshold.
+        if not self._klaus_wall_acquired and wall_signal < 0.08:
             self.klaus_wall_seek_streak += 1
             if self.klaus_wall_seek_streak % 2 == 0:
                 return MotionPlan("forward", 0, speed_level, "explore", "klaus:probe_perimeter")
             return MotionPlan(preferred_turn, wide_turn_ms, speed_level, "turn", "klaus:acquire_perimeter")
-        self.klaus_wall_seek_streak = 0
+        if wall_signal >= 0.12:
+            self._klaus_wall_acquired = True
+            self.klaus_wall_seek_streak = 0
+        elif wall_signal < 0.06:
+            self._klaus_wall_acquired = False
+            self.klaus_wall_seek_streak = 0
 
         if wall_signal > 0.72:
             return MotionPlan(opposite, 620, speed_level, "turn", "klaus:clearance_correction")
 
-        if forward_dur >= (KLAUS_ARC_INTERVAL * 1.2):
+        if forward_dur >= self._sample("arc_interval", KLAUS_ARC_INTERVAL * 1.2):
             arc_turn: Literal["left", "right"] = preferred_turn
             if cycle_count % 5 == 0:
                 arc_turn = opposite
@@ -328,30 +403,45 @@ class IntentPlanner:
         light = str(telemetry.get("brightness", "Normal"))
         forward_dur = self._forward_duration(now_ts)
 
+        # Brightness freeze with hysteresis: enter on any bright frame, only
+        # resume after two consecutive non-bright frames.
         if light == "Bright" and intent.hazard == "none":
-            self.zog_freeze_cooldown = 2
+            self._zog_bright_streak += 1
+            self._zog_clear_streak = 0
+            self._zog_frozen = True
             return MotionPlan("stop", 0, "slow", "hold", "zog7:freeze_in_light")
 
-        if self.zog_freeze_cooldown > 0:
-            self.zog_freeze_cooldown -= 1
-            if self.stop_streak == 0:
+        self._zog_clear_streak += 1
+        self._zog_bright_streak = 0
+
+        if self._zog_frozen:
+            if self._zog_clear_streak < 2:
                 return MotionPlan("stop", 0, "slow", "hold", "zog7:concealment_pause")
+            self._zog_frozen = False
 
         if intent.hazard == "hard" or intent.frontier == "blocked":
             return MotionPlan("backward", ESCAPE_BACKWARD_MS, "slow", "reverse", "zog7:tactical_reset")
 
-        if wall_signal < 0.06:
+        # Edge-following hysteresis.
+        if not self._zog_edge_acquired and wall_signal < 0.06:
+            self._zog_edge_acquired = False
             return MotionPlan(preferred_turn, 620, speed_level, "turn", "zog7:seek_edge")
+        if wall_signal >= 0.10:
+            self._zog_edge_acquired = True
+        elif wall_signal < 0.04:
+            self._zog_edge_acquired = False
 
         if wall_signal > 0.70:
             return MotionPlan(opposite, 520, speed_level, "turn", "zog7:standoff_adjust")
 
-        if forward_dur >= 3.6:
+        if forward_dur >= self._sample("listen_pause", 3.6):
             return MotionPlan("stop", 0, "slow", "hold", "zog7:listen_pause")
 
         return MotionPlan("forward", 0, speed_level, "explore", "zog7:shadow_run")
 
     def plan(self, intent: StrategyIntent, telemetry: dict, cycle_count: int, now_ts: float) -> MotionPlan:
+        self._begin_episode_if_new()
+
         if (
             self._latched_plan
             and now_ts < self._latched_until_ts
@@ -363,6 +453,7 @@ class IntentPlanner:
                 duration_ms=self._latched_plan.duration_ms,
                 speed_level=self._latched_plan.speed_level,
                 mode=self._latched_plan.mode,
+                steer=self._latched_plan.steer,
                 reason=f"{self._latched_plan.reason}|latched",
             )
 
@@ -387,7 +478,16 @@ class IntentPlanner:
         else:
             plan = MotionPlan("forward", 0, speed_level, "explore", "default:advance")
 
+        # Continuous proportional steering: shape blind forward bursts into
+        # gentle arcs using the per-cycle side obstacle ratios.
+        if plan.action == "forward" and plan.mode == "explore":
+            plan.steer = self._compute_steer(telemetry)
+            if abs(plan.steer) >= 0.01:
+                plan.reason = f"{plan.reason}|steer{plan.steer:+.2f}"
+
+        plan = self._maybe_idle_glance(plan, now_ts)
         self._register_action(plan.action, now_ts)
+
         self._latch_plan(plan, now_ts)
         plan.reason = f"{plan.reason}|{speed_reason}"
         return plan

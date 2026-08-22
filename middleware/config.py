@@ -37,15 +37,21 @@ STRATEGY_LOCAL_ONLY_SEC = float(os.getenv("STRATEGY_LOCAL_ONLY_SEC", "60.0"))
 
 LEASE_HEARTBEAT_SEC = 0.4
 LEASE_MISSED_LIMIT = 3
+# Remote teleop: heartbeat only renews remote motion while commands arrived
+# within this window; afterwards the firmware lease timeout halts the robot.
+REMOTE_RENEWAL_WINDOW_SEC = float(os.getenv("REMOTE_RENEWAL_WINDOW_SEC", "0.7"))
 
 VISUAL_STALL_SCORE_MAX = 3.0
 MOTION_RECOVERY_SCORE = 6.0
 RECOVERY_NUDGE_STREAK = 2
 RECOVERY_ESCAPE_STREAK = 4
 RECOVERY_HARD_STREAK = 6
-RECOVERY_COOLDOWN_NUDGE = 1
-RECOVERY_COOLDOWN_ESCAPE = 2
-RECOVERY_COOLDOWN_HARD = 3
+# Cooldowns are time-based now (previously cycle-count based).
+RECOVERY_COOLDOWN_NUDGE_SEC = float(os.getenv("RECOVERY_COOLDOWN_NUDGE_SEC", "0.5"))
+RECOVERY_COOLDOWN_ESCAPE_SEC = float(os.getenv("RECOVERY_COOLDOWN_ESCAPE_SEC", "1.0"))
+RECOVERY_COOLDOWN_HARD_SEC = float(os.getenv("RECOVERY_COOLDOWN_HARD_SEC", "1.5"))
+# Expected observe() interval; streaks decay proportionally when called slower.
+RECOVERY_EXPECTED_INTERVAL_SEC = float(os.getenv("RECOVERY_EXPECTED_INTERVAL_SEC", "0.4"))
 FORWARD_BURST_DEFAULT_MS = int(os.getenv("FORWARD_BURST_DEFAULT_MS", "850"))
 KLAUS_ARC_INTERVAL = int(os.getenv("KLAUS_ARC_INTERVAL", "3"))
 KLAUS_ARC_TURN_MS = int(os.getenv("KLAUS_ARC_TURN_MS", "760"))
@@ -56,6 +62,8 @@ PLAN_LATCH_TURN_SEC = float(os.getenv("PLAN_LATCH_TURN_SEC", "0.9"))
 
 CONTROL_BUDGET_SEC = float(os.getenv("CONTROL_BUDGET_SEC", "60.0"))
 CONTROL_INACTIVITY_SEC = float(os.getenv("CONTROL_INACTIVITY_SEC", "3.0"))
+# Pause between loop cycles after a failsafe stop, to avoid stop/start thrash.
+FAILSAFE_BACKOFF_SEC = float(os.getenv("FAILSAFE_BACKOFF_SEC", "1.5"))
 
 TURN_SIDE_MARGIN = 0.08
 SIDE_STEER_RATIO_THRESHOLD = 0.22
@@ -65,6 +73,17 @@ SCENE_HARD_CLEAR_THRESHOLD = 0.30
 SCENE_SOFT_CLEAR_THRESHOLD = 0.22
 SCENE_FORWARD_CLEAR_THRESHOLD = 0.16
 SCENE_HOLD_RESET_THRESHOLD = 0.12
+
+# Continuous proportional steering (differential drive arcs during cruise).
+STEER_GAIN = float(os.getenv("STEER_GAIN", "2.5"))
+STEER_DEADBAND = float(os.getenv("STEER_DEADBAND", "0.06"))
+STEER_MAX = float(os.getenv("STEER_MAX", "0.6"))
+
+# Naturalness: threshold jitter and idle micro-behaviors.
+JITTER_FRACTION = float(os.getenv("JITTER_FRACTION", "0.25"))
+IDLE_GLANCE_PROBABILITY = float(os.getenv("IDLE_GLANCE_PROBABILITY", "0.15"))
+IDLE_GLANCE_MIN_INTERVAL_SEC = float(os.getenv("IDLE_GLANCE_MIN_INTERVAL_SEC", "8.0"))
+IDLE_GLANCE_TURN_MS = int(os.getenv("IDLE_GLANCE_TURN_MS", "260"))
 
 TURN_DURATION_MS = {
     "benson": 600,

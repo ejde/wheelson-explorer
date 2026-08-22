@@ -86,6 +86,23 @@ float telemetryObstacleLeftRatio = 0.0f;
 float telemetryObstacleRightRatio = 0.0f;
 uint8_t *visual_rgb_buf = nullptr;
 
+// Smoothed (EMA) obstacle ratios and latched obstruction with hysteresis.
+// Raw per-frame ratios are noisy; decisions use the filtered values.
+#define OBSTACLE_EMA_ALPHA 0.35f
+float emaObstacleLeftRatio = 0.0f;
+float emaObstacleRightRatio = 0.0f;
+bool emaSeeded = false;
+float obstacleEnterRatio = 0.40f; // settable via /move "obstacle_threshold" (thousandths)
+const float OBSTACLE_EXIT_RATIO_FACTOR = 0.75f; // exit at enter*0.75
+
+// Rolling floor color reference: only updated while the frame looks clear so
+// a passing obstacle never poisons the reference.
+int refFloorR = -1;
+int refFloorG = -1;
+int refFloorB = -1;
+static const int FLOOR_REF_ALPHA_NUM = 1;
+static const int FLOOR_REF_ALPHA_DEN = 8;
+
 // Last accepted command metadata (from middleware authority)
 String activeCommandId = "boot";
 String activeCommandSource = "bootstrap";
@@ -233,6 +250,17 @@ bool consumeSafetyLatch(String &reason) {
 }
 
 // ─── MOTOR CONTROL ───────────────────────────────────────────────────────────
+//
+// All driving goes through slew-limited wheel targets: commands set TARGET
+// intensities, and loop() ramps the ACTUAL intensities toward them so starts,
+// stops, and turns are eased instead of bang-bang.
+
+#define MOTOR_COUNT 4
+#define SLEW_UNITS_PER_MS 0.6f // full-scale (127) sweep in ~210 ms
+
+int8_t motorTarget[MOTOR_COUNT] = {0, 0, 0, 0};
+int8_t motorCurrent[MOTOR_COUNT] = {0, 0, 0, 0};
+unsigned long lastMotorRampTime = 0;
 
 /**
  * Send a signed-intensity command to one motor via I2C.
@@ -247,6 +275,47 @@ void setMotor(uint8_t id, int8_t intensity) {
 }
 
 /**
+ * Ramp actual wheel intensities toward targets. Called every loop() pass.
+ */
+void updateMotors() {
+  unsigned long now = millis();
+  unsigned long dt = now - lastMotorRampTime;
+  if (dt == 0) return;
+  lastMotorRampTime = now;
+  float step = SLEW_UNITS_PER_MS * (float)dt;
+  if (step > 127.0f) step = 127.0f;
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+    int16_t cur = motorCurrent[i];
+    int16_t tgt = motorTarget[i];
+    if (cur == tgt) continue;
+    if (tgt > cur) {
+      cur += (int16_t)step;
+      if (cur > tgt) cur = tgt;
+    } else {
+      cur -= (int16_t)step;
+      if (cur < tgt) cur = tgt;
+    }
+    motorCurrent[i] = (int8_t)cur;
+    setMotor(i, motorCurrent[i]);
+  }
+}
+
+void setWheelTargets(int8_t fl, int8_t bl, int8_t fr, int8_t br) {
+  motorTarget[MOTOR_FL] = fl;
+  motorTarget[MOTOR_BL] = bl;
+  motorTarget[MOTOR_FR] = fr;
+  motorTarget[MOTOR_BR] = br;
+}
+
+/**
+ * Differential drive primitive: signed left/right side intensities (-127..127).
+ */
+void driveDifferential(int8_t left, int8_t right) {
+  setWheelTargets(left, left, right, right);
+}
+
+/**
  * Send a brightness command to the headlights via I2C.
  * Matches the byte protocol in WheelsonLED::setHeadlight().
  */
@@ -258,41 +327,28 @@ void setHeadlight(uint8_t brightness) {
 }
 
 void stopMotors() {
-  for (uint8_t i = 0; i < 4; i++)
-    setMotor(i, 0);
+  setWheelTargets(0, 0, 0, 0);
 }
 
 // Drive all four wheels forward
 void driveForward() {
   int8_t forwardSpeed = (int8_t)(currentSpeed * FORWARD_SPEED_SCALE);
-  setMotor(MOTOR_FL, forwardSpeed);
-  setMotor(MOTOR_BL, forwardSpeed);
-  setMotor(MOTOR_FR, forwardSpeed);
-  setMotor(MOTOR_BR, forwardSpeed);
+  setWheelTargets(forwardSpeed, forwardSpeed, forwardSpeed, forwardSpeed);
 }
 
 // Drive all four wheels backward
 void driveBackward() {
-  setMotor(MOTOR_FL, -currentSpeed);
-  setMotor(MOTOR_BL, -currentSpeed);
-  setMotor(MOTOR_FR, -currentSpeed);
-  setMotor(MOTOR_BR, -currentSpeed);
+  setWheelTargets(-currentSpeed, -currentSpeed, -currentSpeed, -currentSpeed);
 }
 
 // Left wheels backward, right wheels forward → pivot left
 void turnLeft() {
-  setMotor(MOTOR_FL, -currentSpeed);
-  setMotor(MOTOR_BL, -currentSpeed);
-  setMotor(MOTOR_FR, currentSpeed);
-  setMotor(MOTOR_BR, currentSpeed);
+  setWheelTargets(-currentSpeed, -currentSpeed, currentSpeed, currentSpeed);
 }
 
 // Left wheels forward, right wheels backward → pivot right
 void turnRight() {
-  setMotor(MOTOR_FL, currentSpeed);
-  setMotor(MOTOR_BL, currentSpeed);
-  setMotor(MOTOR_FR, -currentSpeed);
-  setMotor(MOTOR_BR, -currentSpeed);
+  setWheelTargets(currentSpeed, currentSpeed, -currentSpeed, -currentSpeed);
 }
 
 // ─── DISTANCE SENSOR ─────────────────────────────────────────────────────────
@@ -339,6 +395,8 @@ float readDistanceCM() {
 /**
  * Perform a fast pixel-level analysis of a QQVGA (160x120) RGB565 frame buffer.
  * Estimates floor obstacles by comparing lookahead color to safe floor color.
+ * Uses an EMA on ratios, a latched decision with hysteresis, and a rolling
+ * floor-color reference that only updates while the frame looks clear.
  */
 void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
   uint16_t *pixels = (uint16_t *)rgb565_pixels;
@@ -361,9 +419,25 @@ void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
 
   if (safe_count == 0)
     return;
-  int ref_r = r_sum / safe_count;
-  int ref_g = g_sum / safe_count;
-  int ref_b = b_sum / safe_count;
+  int raw_r = r_sum / safe_count;
+  int raw_g = g_sum / safe_count;
+  int raw_b = b_sum / safe_count;
+
+  // Rolling reference: blend toward the new sample only while unobstructed.
+  if (!telemetryObstructed) {
+    if (refFloorR < 0) {
+      refFloorR = raw_r;
+      refFloorG = raw_g;
+      refFloorB = raw_b;
+    } else {
+      refFloorR += (raw_r - refFloorR) * FLOOR_REF_ALPHA_NUM / FLOOR_REF_ALPHA_DEN;
+      refFloorG += (raw_g - refFloorG) * FLOOR_REF_ALPHA_NUM / FLOOR_REF_ALPHA_DEN;
+      refFloorB += (raw_b - refFloorB) * FLOOR_REF_ALPHA_NUM / FLOOR_REF_ALPHA_DEN;
+    }
+  }
+  int ref_r = refFloorR;
+  int ref_g = refFloorG;
+  int ref_b = refFloorB;
 
   // 2. Scan the "lookahead" area (rows height/2 - 10 to height-40)
   int obstacle_pixels = 0;
@@ -418,12 +492,30 @@ void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
   if (total_lookahead == 0)
     return;
 
-  // Output Telemetry: Require 40% of the active path to be a different color
-  telemetryObstructed = ((float)obstacle_pixels / total_lookahead) > 0.40f;
-  telemetryObstacleLeftRatio =
-      total_left > 0 ? ((float)obstacle_left / total_left) : 0.0f;
-  telemetryObstacleRightRatio =
-      total_right > 0 ? ((float)obstacle_right / total_right) : 0.0f;
+  // EMA smoothing of raw ratios before any decision uses them.
+  float rawRatio = (float)obstacle_pixels / total_lookahead;
+  float rawLeft = total_left > 0 ? ((float)obstacle_left / total_left) : 0.0f;
+  float rawRight = total_right > 0 ? ((float)obstacle_right / total_right) : 0.0f;
+  if (!emaSeeded) {
+    emaObstacleLeftRatio = rawLeft;
+    emaObstacleRightRatio = rawRight;
+    emaSeeded = true;
+  } else {
+    emaObstacleLeftRatio += OBSTACLE_EMA_ALPHA * (rawLeft - emaObstacleLeftRatio);
+    emaObstacleRightRatio += OBSTACLE_EMA_ALPHA * (rawRight - emaObstacleRightRatio);
+  }
+  telemetryObstacleLeftRatio = emaObstacleLeftRatio;
+  telemetryObstacleRightRatio = emaObstacleRightRatio;
+
+  // Latched obstruction with hysteresis: enter high, exit low.
+  float exitRatio = obstacleEnterRatio * OBSTACLE_EXIT_RATIO_FACTOR;
+  if (telemetryObstructed) {
+    if (rawRatio < exitRatio)
+      telemetryObstructed = false;
+  } else {
+    if (rawRatio > obstacleEnterRatio)
+      telemetryObstructed = true;
+  }
 
   int avg_luma = total_luma / total_lookahead;
   if (avg_luma < 15)
@@ -581,6 +673,13 @@ void handleMove() {
     visualObstacleSafetyEnabled = true;
   }
 
+  // Optional runtime tuning of the obstruction enter threshold
+  // (thousandths, e.g. 400 = 0.40). Applies to any /move command.
+  int thrMille = extractJsonInt(body, "obstacle_threshold");
+  if (thrMille > 0 && thrMille <= 1000) {
+    obstacleEnterRatio = thrMille / 1000.0f;
+  }
+
   String safetyReason = safetyStopReason;
   bool safety_fired = safetyStopLatched;
   if (safetyReason.length() == 0) {
@@ -668,6 +767,33 @@ void handleMove() {
     duration_ms = 0;
     isMovingIndefinitely = (action != "stop");
     commandedAction = action;
+  } else if (command == "drive") {
+    // Differential drive: signed side intensities, lease-renewed like
+    // move_indefinitely. Slew limiting in loop() eases the transition.
+    int leftI = constrain(extractJsonInt(body, "left"), -127, 127);
+    int rightI = constrain(extractJsonInt(body, "right"), -127, 127);
+
+    consumeSafetyLatch(consumedSafetyReason);
+    driveDifferential((int8_t)leftI, (int8_t)rightI);
+    bool moving = (leftI != 0 || rightI != 0);
+    currentMoveAction = moving ? "drive" : "stop";
+    commandedAction = currentMoveAction;
+    isMovingIndefinitely = moving;
+    lastDistanceCheckTime = millis();
+    lastLeaseCommandTime = millis();
+    navState = moving ? NAV_CRUISE : NAV_HOLD;
+
+    String dResp = "{\"ok\":true,\"action\":\"drive\",\"left\":" + String(leftI) +
+                   ",\"right\":" + String(rightI) + ",\"duration_ms\":0,\"safety\":" +
+                   String(safety_fired ? "true" : "false") + ",\"safety_reason\":\"" +
+                   jsonEscape(safetyReason) + "\",\"busy\":false,\"command_id\":\"" +
+                   jsonEscape(activeCommandId) + "\",\"source\":\"" +
+                   jsonEscape(activeCommandSource) + "\",\"mode\":\"" +
+                   jsonEscape(activeCommandMode) + "\",\"nav_state\":\"" +
+                   String(navStateName(navState)) + "\"}";
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", dResp);
+    return;
   } else {
     // Legacy parsing
     if (action.length() == 0)
@@ -752,6 +878,7 @@ void setup() {
   // I2C → Nuvoton motor controller
   Wire.begin(I2C_SDA, I2C_SCL);
   stopMotors();
+  lastMotorRampTime = millis();
   lastLeaseCommandTime = millis();
   Serial.println("[MOTORS] I2C ready");
 
@@ -795,6 +922,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  updateMotors();
 
   unsigned long now = millis();
 
@@ -829,8 +957,11 @@ void loop() {
       }
     }
 
-    // Reactive hard-stop: if cruising forward and vision detects obstacle
-    if (visualObstacleSafetyEnabled && navState == NAV_CRUISE && currentMoveAction == "forward" &&
+    // Reactive hard-stop: if cruising forward (plain or arc) and vision
+    // detects an obstacle ahead.
+    bool drivingForward =
+        motorTarget[MOTOR_FL] > 0 && motorTarget[MOTOR_FR] > 0;
+    if (visualObstacleSafetyEnabled && navState == NAV_CRUISE && drivingForward &&
         telemetryObstructed) {
       stopMotors();
       currentMoveAction = "stop";

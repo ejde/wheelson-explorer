@@ -1,6 +1,6 @@
 """
 wheelson-explorer · middleware · recovery.py
-Deterministic recovery FSM.
+Deterministic recovery FSM (time-based cooldowns and streak decay).
 """
 
 from dataclasses import dataclass
@@ -13,9 +13,10 @@ from config import (
     RECOVERY_NUDGE_STREAK,
     RECOVERY_ESCAPE_STREAK,
     RECOVERY_HARD_STREAK,
-    RECOVERY_COOLDOWN_NUDGE,
-    RECOVERY_COOLDOWN_ESCAPE,
-    RECOVERY_COOLDOWN_HARD,
+    RECOVERY_COOLDOWN_NUDGE_SEC,
+    RECOVERY_COOLDOWN_ESCAPE_SEC,
+    RECOVERY_COOLDOWN_HARD_SEC,
+    RECOVERY_EXPECTED_INTERVAL_SEC,
 )
 
 
@@ -25,17 +26,33 @@ class RecoveryTrigger:
     turn_direction: Literal["left", "right"]
 
 
+def _cooldown_sec_for_level(level: int) -> float:
+    if level == 1:
+        return RECOVERY_COOLDOWN_NUDGE_SEC
+    if level == 2:
+        return RECOVERY_COOLDOWN_ESCAPE_SEC
+    return RECOVERY_COOLDOWN_HARD_SEC
+
+
 class RecoveryController:
     def __init__(self):
-        self.low_motion_streak = 0
+        self.low_motion_streak = 0.0
         self.escalation_level = 0
-        self.cooldown_cycles = 0
+        self.cooldown_cycles = 0  # remaining cooldown seconds (kept name for telemetry compat)
+        self._cooldown_until_ts = 0.0
         self._last_turn: Literal["left", "right"] = "left"
+        self._last_observe_ts: float | None = None
+
+    @property
+    def low_motion_streak_int(self) -> int:
+        return int(self.low_motion_streak)
 
     def reset(self) -> None:
-        self.low_motion_streak = 0
+        self.low_motion_streak = 0.0
         self.escalation_level = 0
         self.cooldown_cycles = 0
+        self._cooldown_until_ts = 0.0
+        self._last_observe_ts = None
 
     def _choose_turn(self, telemetry: dict) -> Literal["left", "right"]:
         left_ratio = telemetry.get("obstacle_left_ratio", 0.0)
@@ -55,15 +72,29 @@ class RecoveryController:
         tracking_forward: bool,
         motion_score: float,
         telemetry: dict,
+        now_ts: float | None = None,
     ) -> RecoveryTrigger | None:
-        if self.cooldown_cycles > 0:
-            self.cooldown_cycles -= 1
+        if now_ts is None:
+            import time
+
+            now_ts = time.monotonic()
+
+        # Time-aware decay: if the loop ran slower than expected, bleed the
+        # streak proportionally so thresholds stay wall-clock meaningful.
+        if self._last_observe_ts is not None:
+            elapsed = max(0.0, now_ts - self._last_observe_ts)
+            excess = elapsed - RECOVERY_EXPECTED_INTERVAL_SEC
+            if excess > 0:
+                self.low_motion_streak = max(0.0, self.low_motion_streak - excess / RECOVERY_EXPECTED_INTERVAL_SEC)
+        self._last_observe_ts = now_ts
+
+        in_cooldown = now_ts < self._cooldown_until_ts
 
         if not tracking_forward or motion_score < 0.0:
             if motion_score >= MOTION_RECOVERY_SCORE:
                 self.reset()
             else:
-                self.low_motion_streak = max(0, self.low_motion_streak - 1)
+                self.low_motion_streak = max(0.0, self.low_motion_streak - 1.0)
             return None
 
         if motion_score >= MOTION_RECOVERY_SCORE:
@@ -71,31 +102,32 @@ class RecoveryController:
             return None
 
         if motion_score < VISUAL_STALL_SCORE_MAX:
-            self.low_motion_streak += 2
+            self.low_motion_streak += 2.0
         elif motion_score < MOTION_RECOVERY_SCORE:
-            self.low_motion_streak += 1
-        else:
-            return None
+            self.low_motion_streak += 1.0
 
-        if self.cooldown_cycles > 0:
+        if in_cooldown:
             return None
 
         turn_direction = self._choose_turn(telemetry)
 
         if self.escalation_level == 0 and self.low_motion_streak >= RECOVERY_NUDGE_STREAK:
             self.escalation_level = 1
-            self.cooldown_cycles = RECOVERY_COOLDOWN_NUDGE
+            self.cooldown_cycles = _cooldown_sec_for_level(1)
+            self._cooldown_until_ts = now_ts + self.cooldown_cycles
             return RecoveryTrigger(level="nudge", turn_direction=turn_direction)
 
         if self.escalation_level == 1 and self.low_motion_streak >= RECOVERY_ESCAPE_STREAK:
             self.escalation_level = 2
-            self.cooldown_cycles = RECOVERY_COOLDOWN_ESCAPE
+            self.cooldown_cycles = _cooldown_sec_for_level(2)
+            self._cooldown_until_ts = now_ts + self.cooldown_cycles
             return RecoveryTrigger(level="escape", turn_direction=turn_direction)
 
         if self.escalation_level >= 2 and self.low_motion_streak >= RECOVERY_HARD_STREAK:
             self.escalation_level = 0
-            self.low_motion_streak = 0
-            self.cooldown_cycles = RECOVERY_COOLDOWN_HARD
+            self.low_motion_streak = 0.0
+            self.cooldown_cycles = _cooldown_sec_for_level(3)
+            self._cooldown_until_ts = now_ts + self.cooldown_cycles
             return RecoveryTrigger(level="hard_escape", turn_direction=turn_direction)
 
         return None
