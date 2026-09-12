@@ -16,7 +16,7 @@ from recovery import RecoveryController
 
 
 class TestTelemetryReconciliation(unittest.TestCase):
-    def test_vlm_source_trusts_vlm(self):
+    def test_local_collision_evidence_constrains_vlm(self):
         """Verify that when the source is 'vlm', the VLM's hazard evaluation is trusted and not overridden by noisy visual_obstacle."""
         telemetry = {
             "visual_obstacle": True,
@@ -24,7 +24,7 @@ class TestTelemetryReconciliation(unittest.TestCase):
             "obstacle_right_ratio": 0.45,
             "nav_state": "CRUISE",
         }
-        # Under VLM source, hazard = 'none' should be preserved despite visual_obstacle=True
+        # Even a VLM clear-lane label cannot waive fresh local collision evidence.
         frontier, traversability, hazard = _reconcile_scene_with_telemetry(
             frontier="forward",
             traversability="high",
@@ -32,9 +32,9 @@ class TestTelemetryReconciliation(unittest.TestCase):
             telemetry=telemetry,
             source="vlm",
         )
-        self.assertEqual(hazard, "none")
-        self.assertEqual(frontier, "forward")
-        self.assertEqual(traversability, "high")
+        self.assertEqual(hazard, "hard")
+        self.assertEqual(frontier, "blocked")
+        self.assertEqual(traversability, "medium")
 
     def test_local_source_falls_back_to_telemetry(self):
         """Verify that when the source is 'local' (fallback), noisy telemetry overrides hazard evaluation."""
@@ -96,8 +96,8 @@ class TestMotionSupervisorSafetyInjection(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPlannerLatching(unittest.TestCase):
-    def test_planner_latches_turn_plans(self):
-        """Verify that turn plans are latched and returned during the latch duration."""
+    def test_planner_latches_exploration_arcs(self):
+        """Open-space turns become persistent arcs with live steering."""
         planner = IntentPlanner()
         planner.set_persona("benson")
         
@@ -116,18 +116,20 @@ class TestPlannerLatching(unittest.TestCase):
         now = 100.0
         # First plan - benson should plan a turn to the left because frontier is left
         plan = planner.plan(intent, telemetry, cycle_count=20, now_ts=now)
-        self.assertEqual(plan.action, "left")
+        self.assertEqual(plan.action, "forward")
+        self.assertGreater(plan.steer, 0)
         self.assertIn("benson:frontier_turn", plan.reason)
         
         # Second plan - immediately after, latch should be active, so same plan is returned
         plan2 = planner.plan(intent, telemetry, cycle_count=21, now_ts=now + 0.2)
-        self.assertEqual(plan2.action, "left")
+        self.assertEqual(plan2.action, "forward")
+        self.assertEqual(plan2.maneuver_id, plan.maneuver_id)
         self.assertIn("latched", plan2.reason)
         
         # Third plan - after latch duration (0.9s for turns), latch should be expired
         # Benson's forward chain streak resets, let's say frontier is now forward
         intent.frontier = "forward"
-        plan3 = planner.plan(intent, telemetry, cycle_count=22, now_ts=now + 1.5)
+        plan3 = planner.plan(intent, telemetry, cycle_count=22, now_ts=now + 3.5)
         self.assertEqual(plan3.action, "forward")
         self.assertNotIn("latched", plan3.reason)
 
@@ -308,26 +310,21 @@ class TestPlannerHysteresisAndGlance(unittest.TestCase):
 
 
 class TestRecoveryTimeBased(unittest.TestCase):
-    def test_cooldown_is_time_based(self):
+    def test_sustained_stall_and_settling(self):
         rec = RecoveryController()
-        rec.escalation_level = 0
-        rec.low_motion_streak = 99
         telemetry = {"obstacle_left_ratio": 0.0, "obstacle_right_ratio": 0.0}
-        trigger = rec.observe(tracking_forward=True, motion_score=1.0, telemetry=telemetry, now_ts=10.0)
-        self.assertIsNotNone(trigger)
+        # A static frame during startup cannot trigger an immediate nudge.
+        for t in (10.0, 10.2, 10.4, 10.6, 10.8, 11.0, 11.2, 11.4):
+            self.assertIsNone(rec.observe(tracking_forward=True, motion_score=1.0,
+                                         telemetry=telemetry, now_ts=t))
+        trigger = rec.observe(tracking_forward=True, motion_score=1.0,
+                              telemetry=telemetry, now_ts=11.8)
         self.assertEqual(trigger.level, "nudge")
-        self.assertAlmostEqual(rec.cooldown_cycles, 0.5)
-
-        # Immediately again (still in cooldown): no new trigger despite huge streak
-        trigger2 = rec.observe(tracking_forward=True, motion_score=1.0, telemetry=telemetry, now_ts=10.1)
-        self.assertIsNone(trigger2)
-
-        # After cooldown expires (10.5), next observe escalates to escape.
-        # The decay from the slow 1.9 s gap is far smaller than the streak.
-        trigger3 = rec.observe(tracking_forward=True, motion_score=1.0, telemetry=telemetry, now_ts=12.0)
-        self.assertIsNotNone(trigger3)
-        self.assertEqual(trigger3.level, "escape")
-        self.assertEqual(rec.escalation_level, 2)
+        self.assertIsNone(rec.observe(tracking_forward=True, motion_score=1.0,
+                                     telemetry=telemetry, now_ts=11.9))
+        trigger = rec.observe(tracking_forward=True, motion_score=1.0,
+                              telemetry=telemetry, now_ts=12.4)
+        self.assertEqual(trigger.level, "escape")
 
     def test_streak_decays_over_slow_cycles(self):
         rec = RecoveryController()
@@ -345,6 +342,8 @@ class TestDifferentialDrive(unittest.IsolatedAsyncioTestCase):
         client = MagicMock(spec=WheelsonClient)
         ok = lambda **kw: {"ok": True, "busy": False, "safety": False}
         client.set_speed = AsyncMock(side_effect=lambda *a, **k: ok())
+        client.renew = AsyncMock(return_value=ok())
+        client.claim = AsyncMock(return_value=None)
         client.stop = AsyncMock(side_effect=lambda *a, **k: ok())
         client.move_timed = AsyncMock(side_effect=lambda action, duration_ms, **k: {
             "ok": True, "busy": False, "safety": False,
@@ -378,7 +377,7 @@ class TestDifferentialDrive(unittest.IsolatedAsyncioTestCase):
         kwargs = sup.client.drive.call_args[1]
         payload_left = sup.client.drive.call_args[0][0]
         payload_right = sup.client.drive.call_args[0][1]
-        base = 40  # SPEED_BASE_INTENSITY medium
+        base = 20  # Same forward scale as straight motion
         self.assertEqual(payload_left, int(base * 0.8))
         self.assertEqual(payload_right, int(base * 1.2))
         # Heartbeat snapshot must carry the drive targets
@@ -386,44 +385,37 @@ class TestDifferentialDrive(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action, "drive")
         self.assertEqual(drive, (int(base * 0.8), int(base * 1.2)))
 
-    async def test_recovery_releases_lock_between_steps(self):
-        """The supervisor lock must be acquirable while recovery sleeps between steps."""
+    async def test_recovery_returns_without_waiting_and_remote_cancels_it(self):
         sup = MotionSupervisor(self._mock_client())
-        task = asyncio.create_task(sup.execute_recovery(
-            level="hard_escape", turn_direction="left",
-            speed_level="slow", source="reactive",
-        ))
-        await asyncio.sleep(0.05)  # let it enter the sequence (sleeps ~2.6s total)
-        try:
-            acquired = await asyncio.wait_for(sup._lock.acquire(), timeout=0.2)
-            self.assertTrue(acquired, "lock held across recovery sleep — heartbeat would starve")
-            sup._lock.release()
-        except asyncio.TimeoutError:
-            self.fail("lock held across recovery sleep — heartbeat would starve")
-        finally:
-            task.cancel()
-            with contextlib_suppress():
-                await task
+        await asyncio.wait_for(sup.execute_recovery(level="hard_escape", turn_direction="left",
+            speed_level="slow", source="reactive"), timeout=0.2)
+        self.assertTrue(sup.recovery_active)
+        self.assertEqual(sup.client.move_timed.await_count, 1)
+        await sup.remote_move("forward")
+        self.assertFalse(sup.recovery_active)
+        await sup.advance_recovery()
+        self.assertEqual(sup.client.move_timed.await_count, 1)
+        self.assertEqual(sup.active_source, "remote")
 
     async def test_remote_move_sets_continuous_action_and_timestamp(self):
         sup = MotionSupervisor(self._mock_client())
         before = asyncio.get_running_loop().time()
         await sup.remote_move("forward")
-        self.assertEqual(sup.active_continuous_action, "forward")
+        self.assertEqual(sup.active_continuous_action, "drive")
         self.assertGreaterEqual(sup._last_remote_command_ts, before)
         gen, action, _, source, _ = await sup._hb_snapshot()
-        self.assertEqual(action, "forward")
+        self.assertEqual(action, "drive")
         self.assertEqual(source, "remote")
 
     async def test_heartbeat_skips_stale_remote_renewal(self):
         from config import REMOTE_RENEWAL_WINDOW_SEC
         sup = MotionSupervisor(self._mock_client())
         await sup.remote_move("forward")
-        sup.client.move_indefinitely.reset_mock()
+        sup.client.renew.reset_mock()
         # Simulate stale commands: push timestamp beyond the renewal window.
         sup._last_remote_command_ts -= (REMOTE_RENEWAL_WINDOW_SEC + 1.0)
         await sup._heartbeat_once()
-        sup.client.move_indefinitely.assert_not_called()
+        sup.client.renew.assert_not_called()
         gen, action, _, _, drive = await sup._hb_snapshot()
         self.assertEqual(action, "stop")
         self.assertIsNone(drive)
@@ -432,11 +424,11 @@ class TestDifferentialDrive(unittest.IsolatedAsyncioTestCase):
         from config import REMOTE_RENEWAL_WINDOW_SEC
         sup = MotionSupervisor(self._mock_client())
         await sup.remote_move("forward")
-        sup.client.move_indefinitely.reset_mock()
+        sup.client.renew.reset_mock()
         await sup._heartbeat_once()
-        sup.client.move_indefinitely.assert_awaited_once()
-        args = sup.client.move_indefinitely.call_args
-        self.assertEqual(args[0][0], "forward")
+        sup.client.renew.assert_awaited_once()
+        args = sup.client.renew.call_args
+        self.assertEqual(args[0][0], sup._motion_command_id)
 
 
 import contextlib

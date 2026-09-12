@@ -58,11 +58,32 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Wheelson Explorer", docs_url=None, redoc_url=None)
+_explorer_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    asyncio.create_task(explorer_loop())
+    global _explorer_task
+    async def run():
+        state.runtime_error = ""
+        try:
+            await explorer_loop()
+        except Exception as exc:
+            state.runtime_error = str(exc)
+            log.exception("Explorer stopped: %s", exc)
+        finally:
+            state.is_running = False
+    _explorer_task = asyncio.create_task(run())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if _explorer_task:
+        _explorer_task.cancel()
+        try:
+            await _explorer_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/", response_class=HTMLResponse)

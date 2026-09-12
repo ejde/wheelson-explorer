@@ -42,6 +42,8 @@ class RecoveryController:
         self._cooldown_until_ts = 0.0
         self._last_turn: Literal["left", "right"] = "left"
         self._last_observe_ts: float | None = None
+        self._forward_since: float | None = None
+        self._low_since: float | None = None
 
     @property
     def low_motion_streak_int(self) -> int:
@@ -53,6 +55,8 @@ class RecoveryController:
         self.cooldown_cycles = 0
         self._cooldown_until_ts = 0.0
         self._last_observe_ts = None
+        self._forward_since = None
+        self._low_since = None
 
     def _choose_turn(self, telemetry: dict) -> Literal["left", "right"]:
         left_ratio = telemetry.get("obstacle_left_ratio", 0.0)
@@ -65,6 +69,11 @@ class RecoveryController:
             return "right"
         self._last_turn = "right" if self._last_turn == "left" else "left"
         return self._last_turn
+
+    def pause_tracking(self) -> None:
+        """Require fresh settling/evidence after a maneuver, preserving escalation."""
+        self._forward_since = self._low_since = None
+        self._last_observe_ts = None
 
     def observe(
         self,
@@ -79,6 +88,7 @@ class RecoveryController:
 
             now_ts = time.monotonic()
 
+        elapsed = RECOVERY_EXPECTED_INTERVAL_SEC
         # Time-aware decay: if the loop ran slower than expected, bleed the
         # streak proportionally so thresholds stay wall-clock meaningful.
         if self._last_observe_ts is not None:
@@ -91,6 +101,7 @@ class RecoveryController:
         in_cooldown = now_ts < self._cooldown_until_ts
 
         if not tracking_forward or motion_score < 0.0:
+            self.pause_tracking()
             if motion_score >= MOTION_RECOVERY_SCORE:
                 self.reset()
             else:
@@ -101,12 +112,22 @@ class RecoveryController:
             self.reset()
             return None
 
-        if motion_score < VISUAL_STALL_SCORE_MAX:
-            self.low_motion_streak += 2.0
-        elif motion_score < MOTION_RECOVERY_SCORE:
-            self.low_motion_streak += 1.0
+        if self._forward_since is None:
+            self._forward_since = now_ts
+        # Ignore acceleration settling; demand a sustained run of fresh evidence.
+        if now_ts - self._forward_since < 0.6:
+            return None
+        if elapsed > 0.8:
+            self._low_since = None
+        if self._low_since is None:
+            self._low_since = now_ts
 
-        if in_cooldown:
+        if motion_score < VISUAL_STALL_SCORE_MAX:
+            self.low_motion_streak += 2.0 * min(elapsed, 0.4) / 0.4
+        elif motion_score < MOTION_RECOVERY_SCORE:
+            self.low_motion_streak += min(elapsed, 0.4) / 0.4
+
+        if in_cooldown or now_ts - self._low_since < 1.0:
             return None
 
         turn_direction = self._choose_turn(telemetry)

@@ -147,8 +147,7 @@
       object-fit: contain;
       image-rendering: pixelated;
       filter: brightness(.95) contrast(1.05) saturate(1.1);
-      /* Camera is mounted upside down; rotate here instead of in the loop. */
-      transform: rotate(180deg);
+      /* Firmware supplies upright frames to the dashboard and the planner. */
     }
 
     .camera-overlay {
@@ -950,6 +949,7 @@
         <div class="label">INTERNAL MONOLOGUE</div>
         <div class="thought-bubble">
           <span id="thought-text">Awaiting first cycle…</span><span class="thought-cursor"></span>
+          <div id="skill-status" style="margin-top:8px;font-size:12px;opacity:.75" aria-live="polite"></div>
         </div>
       </div>
 
@@ -1556,6 +1556,12 @@
       }
       if (data.personality) updatePersonality(data.personality);
       if (data.thought != null) typewrite(data.thought || '…');
+      if (data.executive) {
+        const skill = data.executive;
+        document.getElementById('skill-status').textContent = skill.objective
+          ? `${skill.objective} · step ${skill.step + 1} · ${skill.status}`
+          : `Local exploration · ${skill.status}`;
+      }
       updateAction(data.action || 'stop', !!data.safety);
       updateDistance(parseFloat(data.distance_cm) || 999);
       $cycle.textContent = `CYCLE ${data.cycle || 0}`;

@@ -9,33 +9,41 @@ Autonomous exploration stack for CircuitMess Wheelson using a **subsumption-type
 
 The system is designed so robot motion remains safe and deterministic even when VLM calls are slow or unavailable — and human operators can take direct control at any time via the live dashboard.
 
+**Protocol 2 requires the matching firmware and middleware.** See
+[Motion and planning](docs/CONTROL.md) for the command protocol, timing, LLM skill
+contract, validation commands and floor-tuning procedure.
+
 ## Architecture (Subsumption-Type)
 
 Control is layered by priority. Higher-priority layers can suppress lower-priority intent.
 
-1. **S0 Firmware Safety (hard realtime-ish)**
-- Lease timeout stop (`lease_timeout` latch)
+1. **S0 Firmware Safety and Motor Control**
+- Dedicated 50 Hz motor task with fractional intensity easing
+- Independent 750 ms lease watchdog for continuous and timed movement
+- Forward stop on stale image analysis; emergency stops bypass easing
 - Visual obstacle hard-stop (`visual_obstacle` latch)
 - Exposes camera + telemetry headers + active command metadata
 
 2. **S1 Motion Authority (middleware)**
 - Single writer to `/move` (`MotionSupervisor`)
-- Heartbeat renewal for continuous motion commands
+- Identity-only renewal for continuous and timed motion; session/sequence ordering in firmware
 - Command metadata propagation (`command_id`, `source`, `mode`)
-- Smooth-control cadence: continuous forward lease with short latched plans to avoid action thrash
+- Local 10 Hz target cadence, independent camera producer, live steering during latched maneuvers
 
 3. **S2 Recovery FSM (middleware)**
 - Deterministic nudge/escape/hard-escape escalation
-- Motion-score based no-progress recovery
+- Sustained motion-score stall detection with acceleration settling
+- Non-blocking steps, cancelled atomically by human takeover
 
 4. **S3 Persona Strategist (middleware)**
 - Persona-specific motion doctrine and objectives
 - Distinct policies for `benson`, `sir_david`, `klaus`, `zog7`
 - Can be switched live via dashboard or `POST /persona` without restarting
 
-5. **S4 Semantic Interpreter (VLM, async advisory)**
+5. **S4 LLM Strategist and Skill Executive (async, locally constrained)**
 - VLM outputs scene semantics (`frontier`, `traversability`, `novelty`, `hazard`, `headlight`, `observation`) plus persona commentary text (`commentary`)
-- No direct motor commands from VLM
+- Optional objective and up to three validated explore/follow_boundary/scan/pause skills
+- Persistent executive with completion/cancellation feedback; no direct motor commands from VLM
 
 6. **S5 Human Override (remote control)**
 - Takes priority over all planner/recovery layers
@@ -48,6 +56,8 @@ Control is layered by priority. Higher-priority layers can suppress lower-priori
 flowchart TD
     CAM["Wheelson Camera + Telemetry Headers"] --> VLM["S4 Semantic Interpreter (VLM, async)"]
     CAM --> LSCENE["Local Scene Inference (deterministic fallback)"]
+    VLM --> EXEC["Persistent Skill Executive"]
+    EXEC --> AUTH
     VLM --> CONTRACT["Semantic Contract (TTL + Confirm Gates)"]
     LSCENE --> CONTRACT
 
@@ -70,10 +80,10 @@ The VLM is intentionally non-blocking and non-authoritative for motion.
 
 - **Async only**: planner continues without waiting for VLM completion.
 - **Thought cadence**: persona commentary updates on VLM refresh cadence, then persists between refreshes.
-- **Semantic TTL**: stale VLM semantics expire (`SEMANTIC_TTL_SEC`).
+- **Semantic TTL**: measured from source capture, not response arrival (`SEMANTIC_TTL_SEC`). Stale planning generations are rejected.
 - **Confirmation gates**: risky one-frame labels (`hard`, `blocked`) require confirmation across frames.
 - **Timeout escalation**:
-  - stage 1: timeout fallback (pause + scan behavior)
+  - stage 1: retain valid skills and use fresh local perception; no forced pause/scan
   - stage 2: degraded mode
   - stage 3: temporary `local_only` lockout (`STRATEGY_LOCAL_ONLY_SEC`)
 - **Modes**:
@@ -114,6 +124,9 @@ wheelson-explorer/
 │   ├── scene.py           # VLM calls, scene semantics, StrategyIntent
 │   ├── planner.py         # IntentPlanner (persona-specific planning)
 │   ├── recovery.py        # RecoveryController FSM
+│   ├── perception.py      # Independent camera producer
+│   ├── executive.py       # Persistent skill execution and outcomes
+│   ├── skills.py          # Strict LLM skill contract
 │   ├── remote.py          # Queue/control/persona/chat endpoints
 │   ├── routes.py          # Dashboard, SSE, snapshot, health routes
 │   ├── dashboard.html
@@ -170,6 +183,8 @@ Returns JPEG bytes plus telemetry headers:
 - `X-Active-Command-Mode`
 - `X-Safety-Latched`
 - `X-Safety-Reason`
+- `X-Analysis-Age-MS`, `X-Frame-Orientation`
+- `X-Wheel-Output-Left/Right`, `X-Wheel-Target-Left/Right`
 
 #### `GET /status`
 Returns state JSON including:
@@ -180,35 +195,20 @@ Returns state JSON including:
 - `safety_latched`, `safety_reason`
 
 #### `POST /move`
-Supports command metadata:
-
-- `command_id`
-- `source`
-- `mode`
-
-Supported payload forms:
-
-```json
-{ "command": "set_speed", "level": "slow|medium|fast", "command_id": "...", "source": "...", "mode": "..." }
-```
-
-```json
-{ "command": "set_light", "level": "0..255", "command_id": "...", "source": "...", "mode": "..." }
-```
-
-```json
-{ "command": "move_indefinitely", "direction": "forward|backward|left|right|stop", "command_id": "...", "source": "...", "mode": "..." }
-```
-
-```json
-{ "action": "forward|backward|left|right|stop", "duration_ms": 500, "command_id": "...", "source": "...", "mode": "..." }
-```
+All requests require a claimed `session_id` and increasing `sequence`.
+Middleware handles the protocol automatically. See [protocol examples](docs/CONTROL.md#authority-and-stopping)
+before making direct requests. Supported commands are `claim`, `drive`, `renew`,
+`stop`, `set_speed`, `set_light`, and legacy direction/timed forms inside the
+protocol 2 envelope. Renewals refer to the current motion's `command_id`; they
+never replay a direction or extend a timed maneuver's deadline.
 
 ## Middleware
 
 File: `middleware/main.py`
 
 ### Install
+
+Use Python 3.11 or newer.
 
 ```bash
 cd middleware
@@ -223,7 +223,10 @@ cp .env.example .env
 ```env
 WHEELSON_IP=192.168.1.112
 GEMINI_API_KEY=...
-LOOP_INTERVAL_SEC=1.2
+LOOP_INTERVAL_SEC=0.1
+CAMERA_INTERVAL_SEC=0.15
+PERCEPTION_MAX_AGE_SEC=0.8
+FIRMWARE_VISUAL_SAFETY=True
 PORT=8000
 OLLAMA_BASE_URL=http://localhost:11434
 ```
@@ -251,10 +254,7 @@ STRATEGY_LOCAL_ONLY_SEC=60.0
 FORWARD_BURST_DEFAULT_MS=850
 KLAUS_ARC_INTERVAL=3
 KLAUS_ARC_TURN_MS=760
-TIMEOUT_SCAN_STEPS=2
-TIMEOUT_SCAN_TURN_MS=700
 PLAN_LATCH_FORWARD_SEC=1.8
-PLAN_LATCH_TURN_SEC=0.9
 
 # Remote control
 CONTROL_BUDGET_SEC=60.0        # seconds each person in the queue gets to drive
@@ -328,7 +328,7 @@ Responses are context-aware — the persona references the current scene and its
 
 Default: [http://localhost:8000](http://localhost:8000)
 
-Features: live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay, in-character chat, voice toggle (TTS), connection status indicator, cycle/action badges.
+Features: active skill objective/status, live camera feed, persona switcher, internal monologue typewriter, distance bar, event log, remote control queue panel with D-pad overlay, in-character chat, voice toggle (TTS), connection status indicator, cycle/action badges.
 
 ### `GET /health` (middleware)
 

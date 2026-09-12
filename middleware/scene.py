@@ -35,6 +35,7 @@ from config import (
     PROVIDER,
 )
 import config as _config_module
+from skills import validate_strategy
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +434,9 @@ def _reconcile_scene_with_telemetry(
             traversability = "high"
             hazard = "none"
 
-    # Conversely, hard visual obstacle should not keep "none" hazard.
-    # We only apply this fallback safety override if the assessment source is local (not VLM).
-    if source != "vlm":
+    # Fresh local obstacle evidence also constrains language-selected skills.
+    # The LLM cannot waive the local collision gate.
+    if visual_obstacle:
         if visual_obstacle and hazard == "none":
             hazard = "soft"
             if traversability == "high":
@@ -622,6 +623,7 @@ def _build_prompt(telemetry: dict) -> str:
         f" Persona salience hints: {salience}"
         f"{obs_warn}"
         f" Last planner objective: {state.last_objective}."
+        f" Skill execution feedback: {json.dumps(state.executive)}."
         f" Last VLM commentary: {prior_commentary}."
         f" Last action: {state.last_action} (repeated {state.action_streak}x)."
         f"{streak_warning}"
@@ -719,6 +721,7 @@ async def ask_vlm(
     return {
         "observation": observation,
         "commentary": commentary,
+        "strategy": validate_strategy(parsed.get("strategy")),
         "headlight": _as_bool(parsed.get("headlight", False)),
         "frontier": frontier,
         "traversability": traversability,

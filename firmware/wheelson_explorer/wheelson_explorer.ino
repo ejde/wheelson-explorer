@@ -33,6 +33,9 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include "motion_profile.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 // ─── USER CONFIGURATION ──────────────────────────────────────────────────────
 
@@ -58,12 +61,10 @@ const int8_t SPEED_FAST = 70;
 String currentMoveAction = "stop";
 String commandedAction = "stop";
 bool isMovingIndefinitely = false;
-unsigned long targetStopTime = 0;
 unsigned long lastDistanceCheckTime = 0;
-unsigned long lastLeaseCommandTime = 0;
 const int DISTANCE_CHECK_INTERVAL_MS =
     150; // Increased to 150ms for reliable echoes
-const unsigned long COMMAND_LEASE_TIMEOUT_MS = 1500;
+const unsigned long COMMAND_LEASE_TIMEOUT_MS = 750;
 
 // ON-DEVICE NAVIGATION STATE (reactive safety only; no tactical recovery FSM)
 enum NavState { NAV_HOLD, NAV_CRUISE };
@@ -177,6 +178,8 @@ void nuvotonBegin() {
 
 // ─── FRAME ANALYSIS TIMING ──────────────────────────────────────────────────
 unsigned long lastAnalysisTime = 0;
+unsigned long lastSuccessfulAnalysisTime = 0;
+bool hasAnalysis = false;
 const int ANALYSIS_INTERVAL_MS = 150;
 
 // ─── JSON HELPERS ────────────────────────────────────────────────────────────
@@ -252,83 +255,155 @@ bool consumeSafetyLatch(String &reason) {
 // ─── MOTOR CONTROL ───────────────────────────────────────────────────────────
 //
 // All driving goes through slew-limited wheel targets: commands set TARGET
-// intensities, and loop() ramps the ACTUAL intensities toward them so starts,
+// intensities, and a dedicated task ramps the output toward them so starts,
 // stops, and turns are eased instead of bang-bang.
 
 #define MOTOR_COUNT 4
-#define SLEW_UNITS_PER_MS 0.6f // full-scale (127) sweep in ~210 ms
-
 int8_t motorTarget[MOTOR_COUNT] = {0, 0, 0, 0};
 int8_t motorCurrent[MOTOR_COUNT] = {0, 0, 0, 0};
-unsigned long lastMotorRampTime = 0;
+MotionProfile motorProfiles[MOTOR_COUNT];
+SemaphoreHandle_t motorMutex;
+SemaphoreHandle_t i2cMutex;
+bool motorLeaseArmed = false;
+unsigned long motorLeaseDeadline = 0;
+unsigned long motorTimedDeadline = 0;
+bool motorTimed = false;
+bool motorVisionReady = false;
+unsigned long motorVisionDeadline = 0;
+int motorEvent = 0; // 1 = watchdog, 2 = timed completion, 3 = stale vision.
+String authoritySession;
+unsigned long authoritySequence = 0;
+String motionCommandId;
 
-/**
- * Send a signed-intensity command to one motor via I2C.
- * Matches the byte protocol in WheelsonMotor::setMotor().
- */
 void setMotor(uint8_t id, int8_t intensity) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
   Wire.beginTransmission(NUVOTON_ADDR);
   Wire.write(MOTOR_SET_BYTE);
   Wire.write(id);
   Wire.write(static_cast<uint8_t>(intensity));
   Wire.endTransmission();
+  xSemaphoreGive(i2cMutex);
 }
 
-/**
- * Ramp actual wheel intensities toward targets. Called every loop() pass.
- */
-void updateMotors() {
-  unsigned long now = millis();
-  unsigned long dt = now - lastMotorRampTime;
-  if (dt == 0) return;
-  lastMotorRampTime = now;
-  float step = SLEW_UNITS_PER_MS * (float)dt;
-  if (step > 127.0f) step = 127.0f;
+void zeroMotorsLocked() {
+  motorLeaseArmed = motorTimed = false;
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    motorTarget[i] = motorCurrent[i] = 0;
+    motorProfiles[i].reset();
+    setMotor(i, 0);
+  }
+}
 
-  for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
-    int16_t cur = motorCurrent[i];
-    int16_t tgt = motorTarget[i];
-    if (cur == tgt) continue;
-    if (tgt > cur) {
-      cur += (int16_t)step;
-      if (cur > tgt) cur = tgt;
-    } else {
-      cur -= (int16_t)step;
-      if (cur < tgt) cur = tgt;
+void emergencyStopMotors() {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  zeroMotorsLocked();
+  motorEvent = 0;
+  xSemaphoreGive(motorMutex);
+}
+
+void motorControlTask(void *) {
+  TickType_t wake = xTaskGetTickCount();
+  unsigned long previous = millis();
+  for (;;) {
+    xSemaphoreTake(motorMutex, portMAX_DELAY);
+    unsigned long now = millis();
+    float dt = (now - previous) / 1000.0f;
+    previous = now;
+    if (motorLeaseArmed && motorTarget[MOTOR_FL] > 0 && motorTarget[MOTOR_FR] > 0 &&
+        (!motorVisionReady || (long)(now - motorVisionDeadline) >= 0)) {
+      zeroMotorsLocked();
+      motorEvent = 3;
+    } else if (motorLeaseArmed && (long)(now - motorLeaseDeadline) >= 0) {
+      zeroMotorsLocked();
+      motorEvent = 1;
+    } else if (motorTimed && (long)(now - motorTimedDeadline) >= 0) {
+      for (int i = 0; i < MOTOR_COUNT; ++i) motorTarget[i] = 0;
+      motorLeaseArmed = motorTimed = false;
+      motorEvent = 2;
     }
-    motorCurrent[i] = (int8_t)cur;
-    setMotor(i, motorCurrent[i]);
+    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+      int8_t next = motorProfiles[i].step(motorTarget[i], dt);
+      if (next != motorCurrent[i]) {
+        motorCurrent[i] = next;
+        setMotor(i, next);
+      }
+    }
+    xSemaphoreGive(motorMutex);
+    // Do not run back-to-back catch-up ticks after slow I2C work.
+    if (xTaskGetTickCount() - wake >= pdMS_TO_TICKS(20)) wake = xTaskGetTickCount();
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(20));
+  }
+}
+
+void syncMotorEvent() {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  int event = motorEvent;
+  motorEvent = 0;
+  xSemaphoreGive(motorMutex);
+  if (!event) return;
+  currentMoveAction = commandedAction = "stop";
+  isMovingIndefinitely = false;
+  navState = NAV_HOLD;
+  motionCommandId = "";
+  if (event == 1 || event == 3) {
+    safetyStopLatched = true;
+    safetyStopReason = event == 1 ? "lease_timeout" : "perception_timeout";
   }
 }
 
 void setWheelTargets(int8_t fl, int8_t bl, int8_t fr, int8_t br) {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  if ((motorEvent == 1 || motorEvent == 3) && (fl || bl || fr || br)) {
+    xSemaphoreGive(motorMutex);
+    return; // Watchdog must be acknowledged before any restart.
+  }
+  motorEvent = 0;
   motorTarget[MOTOR_FL] = fl;
   motorTarget[MOTOR_BL] = bl;
   motorTarget[MOTOR_FR] = fr;
   motorTarget[MOTOR_BR] = br;
+  motorLeaseArmed = fl || bl || fr || br;
+  motorLeaseDeadline = millis() + COMMAND_LEASE_TIMEOUT_MS;
+  motorTimed = false;
+  xSemaphoreGive(motorMutex);
 }
 
-/**
- * Differential drive primitive: signed left/right side intensities (-127..127).
- */
+bool renewMotorLease() {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  bool valid = motorLeaseArmed && (long)(millis() - motorLeaseDeadline) < 0;
+  if (valid) motorLeaseDeadline = millis() + COMMAND_LEASE_TIMEOUT_MS;
+  xSemaphoreGive(motorMutex);
+  return valid;
+}
+
+void setTimedDeadline(int duration) {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  motorTimed = true;
+  motorTimedDeadline = millis() + duration;
+  xSemaphoreGive(motorMutex);
+}
+
+bool targetsForward() {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  bool forward = motorTarget[MOTOR_FL] > 0 && motorTarget[MOTOR_FR] > 0;
+  xSemaphoreGive(motorMutex);
+  return forward;
+}
+
 void driveDifferential(int8_t left, int8_t right) {
   setWheelTargets(left, left, right, right);
 }
 
-/**
- * Send a brightness command to the headlights via I2C.
- * Matches the byte protocol in WheelsonLED::setHeadlight().
- */
 void setHeadlight(uint8_t brightness) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
   Wire.beginTransmission(NUVOTON_ADDR);
   Wire.write(HEADLIGHT_SET_BYTE);
   Wire.write(brightness);
   Wire.endTransmission();
+  xSemaphoreGive(i2cMutex);
 }
 
-void stopMotors() {
-  setWheelTargets(0, 0, 0, 0);
-}
+void stopMotors() { setWheelTargets(0, 0, 0, 0); }
 
 // Drive all four wheels forward
 void driveForward() {
@@ -573,6 +648,9 @@ bool initCamera() {
   sensor_t *s = esp_camera_sensor_get();
   s->set_special_effect(s, 0);
   s->set_saturation(s, 2);
+  // Camera is physically inverted: correct it once for safety, VLM and UI.
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
 
   Serial.println("[CAMERA] Ready (160×120 JPEG)");
   return true;
@@ -596,6 +674,16 @@ void handleCamera() {
 
   // Telemetry headers use cached values from the periodic analysis in loop()
   server.sendHeader("X-Distance-CM", String(dist, 1));
+  server.sendHeader("X-Analysis-Age-MS", String(hasAnalysis ? millis() - lastSuccessfulAnalysisTime : 999999UL));
+  server.sendHeader("X-Frame-Orientation", "upright");
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  int outputLeft = motorCurrent[MOTOR_FL], outputRight = motorCurrent[MOTOR_FR];
+  int targetLeft = motorTarget[MOTOR_FL], targetRight = motorTarget[MOTOR_FR];
+  xSemaphoreGive(motorMutex);
+  server.sendHeader("X-Wheel-Output-Left", String(outputLeft));
+  server.sendHeader("X-Wheel-Output-Right", String(outputRight));
+  server.sendHeader("X-Wheel-Target-Left", String(targetLeft));
+  server.sendHeader("X-Wheel-Target-Right", String(targetRight));
   server.sendHeader("X-Raw-Pulse-US", String(lastEchoDuration));
   server.sendHeader("X-Visual-Obstacle",
                     telemetryObstructed ? "true" : "false");
@@ -656,6 +744,39 @@ void handleMove() {
   String action = extractJsonString(body, "action");
   int duration_ms = extractJsonInt(body, "duration_ms");
   String commandId = extractJsonString(body, "command_id");
+  syncMotorEvent();
+  String session = extractJsonString(body, "session_id");
+  int sequenceInput = extractJsonInt(body, "sequence");
+  unsigned long seq = (unsigned long)sequenceInput;
+  if (sequenceInput <= 0) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+  if (command == "claim" && session.length() == 32 &&
+      (session != authoritySession || seq > authoritySequence)) {
+    emergencyStopMotors();
+    authoritySession = session;
+    authoritySequence = seq;
+    motionCommandId = "";
+    currentMoveAction = commandedAction = "stop";
+    isMovingIndefinitely = false;
+    navState = NAV_HOLD;
+    server.send(200, "application/json", "{\"ok\":true,\"protocol\":2}");
+    return;
+  }
+  if (session != authoritySession || session.length() == 0 || seq <= authoritySequence) {
+    server.send(409, "application/json", "{\"ok\":false,\"busy\":true}");
+    return;
+  }
+  authoritySequence = seq;
+  if (command == "renew") {
+    bool valid = extractJsonString(body, "target_id") == motionCommandId &&
+                 motionCommandId.length() > 0 && !safetyStopLatched && renewMotorLease();
+    server.send(valid ? 200 : 409, "application/json",
+                valid ? "{\"ok\":true}" : "{\"ok\":false,\"busy\":true}");
+    return;
+  }
+
   String source = extractJsonString(body, "source");
   String mode = extractJsonString(body, "mode");
 
@@ -733,7 +854,11 @@ void handleMove() {
       safetyReason = "none";
     }
 
-    stopMotors();
+    if (source == "failsafe" || source == "shutdown" || source == "lease_rejected")
+      emergencyStopMotors();
+    else
+      stopMotors();
+    motionCommandId = "";
     action = "stop";
     commandedAction = "stop";
     currentMoveAction = "stop";
@@ -759,6 +884,19 @@ void handleMove() {
     safetyReason = "none";
   }
 
+  bool requestedForward = (action == "forward") ||
+      (command == "move_indefinitely" && extractJsonString(body, "direction") == "forward") ||
+      (command == "drive" && extractJsonInt(body, "left") > 0 && extractJsonInt(body, "right") > 0);
+  if (safety_fired || (visualObstacleSafetyEnabled && telemetryObstructed && requestedForward)) {
+    emergencyStopMotors();
+    motionCommandId = "";
+    currentMoveAction = commandedAction = "stop";
+    isMovingIndefinitely = false;
+    navState = NAV_HOLD;
+    server.send(200, "application/json", "{\"ok\":false,\"action\":\"stop\",\"safety\":true}");
+    return;
+  }
+  motionCommandId = commandId;
   float dist = readDistanceCM();
 
   if (command == "move_indefinitely") {
@@ -769,7 +907,7 @@ void handleMove() {
     commandedAction = action;
   } else if (command == "drive") {
     // Differential drive: signed side intensities, lease-renewed like
-    // move_indefinitely. Slew limiting in loop() eases the transition.
+    // move_indefinitely. The motor task eases the transition.
     int leftI = constrain(extractJsonInt(body, "left"), -127, 127);
     int rightI = constrain(extractJsonInt(body, "right"), -127, 127);
 
@@ -780,7 +918,6 @@ void handleMove() {
     commandedAction = currentMoveAction;
     isMovingIndefinitely = moving;
     lastDistanceCheckTime = millis();
-    lastLeaseCommandTime = millis();
     navState = moving ? NAV_CRUISE : NAV_HOLD;
 
     String dResp = "{\"ok\":true,\"action\":\"drive\",\"left\":" + String(leftI) +
@@ -815,12 +952,9 @@ void handleMove() {
   // Update state variables
   currentMoveAction = action;
   lastDistanceCheckTime = millis();
-  lastLeaseCommandTime = millis();
   navState = (action == "stop") ? NAV_HOLD : NAV_CRUISE;
 
-  if (!isMovingIndefinitely && action != "stop") {
-    targetStopTime = millis() + duration_ms;
-  }
+  duration_ms = constrain(duration_ms, 0, 3000);
 
   // Execute drive logic
   if (action == "forward")
@@ -833,6 +967,8 @@ void handleMove() {
     turnRight();
   else
     stopMotors();
+
+  if (!isMovingIndefinitely && action != "stop") setTimedDeadline(duration_ms);
 
   String boolStr = safety_fired ? "true" : "false";
   String resp = "{\"ok\":true,\"action\":\"" + jsonEscape(action) +
@@ -877,9 +1013,14 @@ void setup() {
 
   // I2C → Nuvoton motor controller
   Wire.begin(I2C_SDA, I2C_SCL);
-  stopMotors();
-  lastMotorRampTime = millis();
-  lastLeaseCommandTime = millis();
+  motorMutex = xSemaphoreCreateMutex();
+  i2cMutex = xSemaphoreCreateMutex();
+  if (!motorMutex || !i2cMutex) { Serial.println("Motor mutex allocation failed"); while (true) delay(1000); }
+  Wire.setTimeOut(10);
+  emergencyStopMotors();
+  if (xTaskCreate(motorControlTask, "motor-control", 4096, nullptr, 3, nullptr) != pdPASS) {
+    Serial.println("Motor task allocation failed"); while (true) delay(1000);
+  }
   Serial.println("[MOTORS] I2C ready");
 
   // Camera
@@ -922,25 +1063,9 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  updateMotors();
+  syncMotorEvent();
 
   unsigned long now = millis();
-
-  // Failsafe: any indefinite motion must be continuously renewed by middleware.
-  if (isMovingIndefinitely && commandedAction != "stop" &&
-      (now - lastLeaseCommandTime > COMMAND_LEASE_TIMEOUT_MS)) {
-    stopMotors();
-    currentMoveAction = "stop";
-    commandedAction = "stop";
-    isMovingIndefinitely = false;
-    navState = NAV_HOLD;
-    safetyStopLatched = true;
-    safetyStopReason = "lease_timeout";
-    Serial.printf(
-        "[FAILSAFE] Motion lease expired after %lums without renew command. "
-        "Motors stopped.\n",
-        now - lastLeaseCommandTime);
-  }
 
   // Periodic frame analysis — runs unconditionally so telemetry is always fresh
   // for both the safety check and /camera HTTP responses.
@@ -952,6 +1077,12 @@ void loop() {
       if (fb) {
         if (jpg2rgb565(fb->buf, fb->len, visual_rgb_buf, JPG_SCALE_NONE)) {
           analyzeFrame(visual_rgb_buf, fb->width, fb->height);
+          lastSuccessfulAnalysisTime = millis();
+          hasAnalysis = true;
+          xSemaphoreTake(motorMutex, portMAX_DELAY);
+          motorVisionReady = true;
+          motorVisionDeadline = millis() + 800;
+          xSemaphoreGive(motorMutex);
         }
         esp_camera_fb_return(fb);
       }
@@ -960,10 +1091,11 @@ void loop() {
     // Reactive hard-stop: if cruising forward (plain or arc) and vision
     // detects an obstacle ahead.
     bool drivingForward =
-        motorTarget[MOTOR_FL] > 0 && motorTarget[MOTOR_FR] > 0;
+        targetsForward();
     if (visualObstacleSafetyEnabled && navState == NAV_CRUISE && drivingForward &&
         telemetryObstructed) {
-      stopMotors();
+      emergencyStopMotors();
+      motionCommandId = "";
       currentMoveAction = "stop";
       commandedAction = "stop";
       isMovingIndefinitely = false;
@@ -976,11 +1108,4 @@ void loop() {
     }
   }
 
-  if (currentMoveAction != "stop" && !isMovingIndefinitely &&
-      now >= targetStopTime) {
-    stopMotors();
-    currentMoveAction = "stop";
-    commandedAction = "stop";
-    navState = NAV_HOLD;
-  }
 }

@@ -35,6 +35,7 @@ async def sse_stream() -> StreamingResponse:
             "personality": state.personality_key,
             "cycle": state.cycle_count,
             "safety": False,
+            "executive": state.executive,
             "ts": datetime.now().strftime("%H:%M:%S"),
         }
         yield f"data: {json.dumps(initial)}\n\n"
@@ -70,7 +71,9 @@ async def health() -> JSONResponse:
     )
     return JSONResponse(
         {
-            "status": "ok",
+            "status": "error" if state.runtime_error else ("ok" if state.is_running else "stopped"),
+            "runtime_error": state.runtime_error,
+            "executive": state.executive,
             "personality": state.personality_key,
             "personality_name": p["name"],
             "cycle_count": state.cycle_count,

@@ -142,27 +142,31 @@ async def queue_join(req: JoinQueueRequest) -> JSONResponse:
 
 async def queue_leave(req: LeaveQueueRequest) -> JSONResponse:
     async with _queue_lock:
+        was_controller = bool(_control_queue and _control_queue[0].token == req.token)
         before = len(_control_queue)
         _control_queue[:] = [s for s in _control_queue if s.token != req.token]
         removed = before - len(_control_queue)
+        if was_controller and _state_module._motion_supervisor is not None:
+            await _state_module._motion_supervisor.release_remote()
     return JSONResponse({"ok": True, "removed": removed})
 
 
 async def remote_control(req: RemoteControlRequest) -> JSONResponse:
-    if not _control_queue or _control_queue[0].token != req.token:
-        return JSONResponse({"error": "not_your_turn"}, status_code=403)
-    session = _control_queue[0]
-    now = asyncio.get_event_loop().time()
-    if (now - session.joined_at) > CONTROL_BUDGET_SEC:
-        return JSONResponse({"error": "session_expired"}, status_code=403)
-    direction = req.direction
-    if direction not in ALL_ACTIONS:
-        return JSONResponse({"error": "invalid_direction"}, status_code=400)
-    session.last_command_at = now
-    motion_sup = _state_module._motion_supervisor
-    if motion_sup is None:
-        return JSONResponse({"error": "not_ready"}, status_code=503)
-    await motion_sup.remote_move(direction)
+    async with _queue_lock:
+        if not _control_queue or _control_queue[0].token != req.token:
+            return JSONResponse({"error": "not_your_turn"}, status_code=403)
+        session = _control_queue[0]
+        now = asyncio.get_event_loop().time()
+        if (now - session.joined_at) > CONTROL_BUDGET_SEC:
+            return JSONResponse({"error": "session_expired"}, status_code=403)
+        direction = req.direction
+        if direction not in ALL_ACTIONS:
+            return JSONResponse({"error": "invalid_direction"}, status_code=400)
+        motion_sup = _state_module._motion_supervisor
+        if motion_sup is None:
+            return JSONResponse({"error": "not_ready"}, status_code=503)
+        session.last_command_at = now
+        await motion_sup.remote_move(direction)
     return JSONResponse({"ok": True})
 
 

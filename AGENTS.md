@@ -22,7 +22,9 @@ python main.py --provider ollama --model llava --personality sir_david
 python -c "import ast; ast.parse(open('main.py').read()); print('OK')"
 ```
 
-There are no automated tests — validation is manual via the dashboard and robot behaviour.
+Run `cd middleware && .venv/bin/python -m unittest discover -q` for mocked motion,
+planning, perception, and integration tests. Firmware profile tests and ESP32
+compile instructions are in `docs/CONTROL.md`. Physical behavior still needs floor trials.
 
 ### Firmware (Arduino / ESP32)
 
@@ -40,25 +42,25 @@ Each layer can suppress the layers below it. **All motor commands go through a s
 
 | Layer | What it does |
 |---|---|
-| **S0 Firmware Safety** | Lease-timeout hard stop; visual-obstacle latch. Always active. |
-| **S1 Motion Authority** | `MotionSupervisor` — asyncio-locked single writer to `/move` (lock never held across sleeps), generation-tagged heartbeat snapshot renewal for continuous motion (including differential `drive` arcs), command ID propagation. |
+| **S0 Firmware Safety** | Dedicated 50 Hz intensity easing; 750 ms watchdog for all motion; stale-vision forward stop; visual-obstacle gate enabled by default. |
+| **S1 Motion Authority** | `MotionSupervisor` — serialized target writes and identity-only renewals; protocol 2 session/sequence ordering; timed maneuver deduplication; atomic remote ownership. |
 | **S2 Recovery FSM** | `RecoveryController` — deterministic nudge → escape → hard-escape escalation triggered by motion-score stall detection. |
 | **S3 Persona Strategist** | `IntentPlanner` — per-persona motion doctrine. Switchable live via `POST /persona`. |
-| **S4 VLM Semantic Interpreter** | Async advisory only. Outputs scene fields (`frontier`, `traversability`, `novelty`, `hazard`) + persona `commentary`. **Never issues motor commands.** |
+| **S4 VLM Semantic Interpreter** | Async scene interpretation plus bounded skill sequences, executed by `SkillExecutive` under local constraints. **Never issues wheel commands.** |
 | **S5 Human Override** | Remote control queue. Halts autonomous motion on takeover; autonomy resumes seamlessly on release/inactivity. |
 
 ### Main Loop (`explorer_loop` in `middleware/loop.py`)
 
 One asyncio task running at `LOOP_INTERVAL_SEC`. Each cycle:
-1. Fetch JPEG + telemetry headers from `GET /camera` on the robot.
-2. Apply pending **persona switch** (`state.pending_persona`) atomically — updates `IntentPlanner` + VLM system prompt.
+1. Read the latest timestamped JPEG/telemetry snapshot from independent `CameraStream`; reject stale camera or obstacle analysis.
+2. Apply pending **persona switch** (`_persona_queue`) atomically — updates `IntentPlanner` + VLM system prompt.
 3. Advance the **control queue** — expire timed-out sessions, update `state.remote_*` fields.
 4. Fire an async **VLM task** if the refresh interval has elapsed (non-blocking).
 5. Consume a completed VLM result → apply semantic contract (TTL + multi-frame confirmation gates).
 6. Fall back to **local scene inference** when VLM is stale or in degraded/`local_only` mode.
 7. Build `StrategyIntent` → run `IntentPlanner.plan()`.
 8. **S5 gate**: if `state.remote_is_active`, skip S2–S3 execution entirely.
-9. Otherwise: run Recovery FSM or apply the planner's `MotionPlan` via `MotionSupervisor`.
+9. Otherwise: advance recovery without sleeping, or tick the skill executive/persona planner and apply live steering through `MotionSupervisor`.
 10. Broadcast SSE event to all connected dashboard clients.
 
 ### Key Classes
@@ -72,15 +74,15 @@ One asyncio task running at `LOOP_INTERVAL_SEC`. Each cycle:
 ### VLM Safety Contract
 
 The VLM is non-blocking and non-authoritative for motion:
-- Semantics expire after `SEMANTIC_TTL_SEC`; local inference fills the gap.
+- Semantics expire after `SEMANTIC_TTL_SEC` from source capture; local inference fills the gap every control tick. Reject results from earlier planning generations.
 - Risky single-frame labels (`hard`, `blocked`) require multi-frame confirmation before acting.
 - Timeout escalation: stage 1 → degraded mode, stage 2 → `local_only` lockout for `STRATEGY_LOCAL_ONLY_SEC`.
 
 ### Remote Control & Persona Switching
 
-- `POST /queue/join` issues a token. `POST /control {token, direction}` calls `MotionSupervisor.remote_move()` — directional commands run as continuous motion renewed by the heartbeat while fresh commands keep arriving (`REMOTE_RENEWAL_WINDOW_SEC`, 0.7 s); after the last command the firmware lease timeout halts the robot.
+- `POST /queue/join` issues a token. `POST /control {token, direction}` calls `MotionSupervisor.remote_move()` — directional commands run as continuous motion renewed by the heartbeat while fresh commands keep arriving (`REMOTE_RENEWAL_WINDOW_SEC`, 0.7 s); after input expiry the middleware requests a stop, with the independent firmware watchdog as fallback.
 - After `CONTROL_INACTIVITY_SEC` (3 s) of no commands, `state.remote_is_active` becomes false and autonomy resumes; the session stays in queue until budget (`CONTROL_BUDGET_SEC`, 60 s) expires or the user calls `POST /queue/leave`.
-- `POST /persona` sets `state.pending_persona`; consumed by the loop on the next cycle.
+- `POST /persona` enqueues `_persona_queue`; consumed by the loop on the next cycle.
 - Queue/controller state is broadcast each SSE cycle: `remote_controller`, `remote_queue_length`, `remote_remaining_s`, `remote_is_active`.
 
 ### Dashboard (`middleware/dashboard.html`)
@@ -96,3 +98,12 @@ Six touch-points across the middleware modules, plus one in `dashboard.html`:
 4. `TURN_DURATION_MS` in `config.py` — default turn length in ms.
 5. `_plan_<key>()` method in `IntentPlanner` (`planner.py`), wired into `IntentPlanner.plan()`.
 6. `PERSONALITIES` object in `dashboard.html` — emoji, color, bias text, voice hints.
+
+### Protocol 2 and Skill Execution
+
+Firmware and middleware must be upgraded together; startup rejects older firmware.
+See `docs/CONTROL.md` for exact protocol examples and physical validation limits.
+`perception.py` owns camera acquisition; `skills.py` validates model output;
+`executive.py` owns persistent egocentric skills and execution feedback. Maneuver
+completion is a time budget, not a claim of measured spatial progress. The camera
+sensor provides upright frames to firmware, middleware, VLM and dashboard.

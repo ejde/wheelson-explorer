@@ -4,6 +4,7 @@ Intent planner (tactical planning, all _plan_* methods).
 """
 
 import random
+from dataclasses import replace
 from typing import Literal
 
 from motion import MotionPlan
@@ -14,9 +15,6 @@ from config import (
     TURN_SIDE_MARGIN,
     FORWARD_BURST_DEFAULT_MS,
     PLAN_LATCH_FORWARD_SEC,
-    PLAN_LATCH_TURN_SEC,
-    TIMEOUT_SCAN_STEPS,
-    TIMEOUT_SCAN_TURN_MS,
     ESCAPE_BACKWARD_MS,
     KLAUS_ARC_INTERVAL,
     KLAUS_ARC_TURN_MS,
@@ -42,7 +40,6 @@ class IntentPlanner:
         self.stop_streak = 0
         self.forward_chain_streak = 0
         self._last_probe_turn: Literal["left", "right"] = "left"
-        self.timeout_scan_budget = 0
         self.klaus_wall_seek_streak = 0
         self.david_turn_bias: Literal["left", "right"] = "left"
         self.zog_freeze_cooldown = 0
@@ -59,6 +56,9 @@ class IntentPlanner:
         self._latched_plan: MotionPlan | None = None
         self._latched_until_ts = 0.0
         self._forward_start_ts = 0.0
+        self._maneuver_seq = 0
+        self._steer = 0.0
+        self._steer_ts = None
 
     def set_persona(self, persona: str) -> None:
         self.persona = persona
@@ -69,7 +69,6 @@ class IntentPlanner:
         self.stop_streak = 0
         self.forward_chain_streak = 0
         self._last_probe_turn = "left"
-        self.timeout_scan_budget = 0
         self.klaus_wall_seek_streak = 0
         self.david_turn_bias = "left"
         self.zog_freeze_cooldown = 0
@@ -83,6 +82,26 @@ class IntentPlanner:
         self._zog_clear_streak = 0
         self._klaus_wall_acquired = False
         self._zog_edge_acquired = False
+        self._steer = 0.0
+        self._steer_ts = None
+
+    def reset_maneuver(self) -> None:
+        self._latched_plan = None
+        self._latched_until_ts = 0.0
+        self._forward_start_ts = 0.0
+        self.last_selected_action = "stop"
+
+    def shape_plan(self, plan: MotionPlan, telemetry: dict, now_ts: float) -> MotionPlan:
+        """Update steering independently of the persistent maneuver."""
+        if plan.action != "forward":
+            self._steer = 0.0
+            self._steer_ts = now_ts
+            return plan
+        requested = max(-STEER_MAX, min(STEER_MAX, plan.steer + self._compute_steer(telemetry)))
+        dt = 0.1 if self._steer_ts is None else max(0.0, min(0.25, now_ts - self._steer_ts))
+        self._steer += max(-1.5 * dt, min(1.5 * dt, requested - self._steer))
+        self._steer_ts = now_ts
+        return replace(plan, steer=self._steer, reason=f"{plan.reason}|steer{self._steer:+.2f}")
 
     def _base_speed(self) -> str:
         return str(self.policy.get("base_speed", "medium"))
@@ -157,6 +176,8 @@ class IntentPlanner:
         reads as attentive rather than frozen."""
         if plan.action != "stop" or plan.mode != "hold":
             return plan
+        if plan.reason not in {"benson:safety_pause", "zog7:listen_pause"}:
+            return plan
         if (now_ts - self._last_glance_ts) < IDLE_GLANCE_MIN_INTERVAL_SEC:
             return plan
         if self._rng.random() >= IDLE_GLANCE_PROBABILITY:
@@ -173,8 +194,11 @@ class IntentPlanner:
 
 
     def _can_interrupt_latch(self, intent: StrategyIntent, telemetry: dict) -> bool:
-        if bool(telemetry.get("strategy_timeout_event", False)):
+        if telemetry.get("safety_latched"):
             return True
+        if self._latched_plan and self._latched_plan.duration_ms > 0:
+            # A bounded pivot/reverse already handles the hazard that selected it.
+            return False
         if bool(telemetry.get("visual_obstacle", False)):
             return True
         if intent.hazard == "hard" or intent.frontier == "blocked":
@@ -187,21 +211,15 @@ class IntentPlanner:
             base_ms = int(self.policy.get("forward_burst_ms", FORWARD_BURST_DEFAULT_MS))
             persona_hold = max(1.0, min(3.0, base_ms / 500.0))
             hold_for = max(PLAN_LATCH_FORWARD_SEC, persona_hold)
-        elif plan.action in {"left", "right"} and plan.duration_ms > 0:
-            hold_for = PLAN_LATCH_TURN_SEC
+        elif plan.duration_ms > 0:
+            hold_for = plan.duration_ms / 1000.0
 
         if hold_for <= 0.0:
             self._latched_plan = None
             self._latched_until_ts = 0.0
             return
 
-        self._latched_plan = MotionPlan(
-            action=plan.action,
-            duration_ms=plan.duration_ms,
-            speed_level=plan.speed_level,
-            mode=plan.mode,
-            reason=plan.reason,
-        )
+        self._latched_plan = replace(plan)
         self._latched_until_ts = now_ts + hold_for
 
     def _frontier_turn(self, intent: StrategyIntent, telemetry: dict) -> Literal["left", "right"]:
@@ -219,34 +237,6 @@ class IntentPlanner:
         if right_ratio + TURN_SIDE_MARGIN < left_ratio:
             return "right"
         return self._choose_probe_turn(telemetry)
-
-    def _strategy_timeout_plan(self, speed_level: str, telemetry: dict) -> MotionPlan | None:
-        if bool(telemetry.get("strategy_timeout_event", False)):
-            requested_steps = _safe_int(telemetry.get("timeout_scan_steps", TIMEOUT_SCAN_STEPS), TIMEOUT_SCAN_STEPS)
-            self.timeout_scan_budget = max(self.timeout_scan_budget, max(1, requested_steps))
-
-        if self.timeout_scan_budget <= 0:
-            return None
-
-        if self.timeout_scan_budget == max(1, _safe_int(telemetry.get("timeout_scan_steps", TIMEOUT_SCAN_STEPS), TIMEOUT_SCAN_STEPS)):
-            plan = MotionPlan(
-                action="stop",
-                duration_ms=0,
-                speed_level="slow",
-                mode="hold",
-                reason="gate:strategist_timeout_pause",
-            )
-        else:
-            plan = MotionPlan(
-                action=self._choose_probe_turn(telemetry),
-                duration_ms=max(TIMEOUT_SCAN_TURN_MS, TURN_DURATION_MS.get(self.persona, 550)),
-                speed_level=speed_level,
-                mode="turn",
-                reason="gate:strategist_timeout_scan",
-            )
-
-        self.timeout_scan_budget = max(0, self.timeout_scan_budget - 1)
-        return plan
 
     def _scene_speed(self, base: str, intent: StrategyIntent, telemetry: dict, cycle_count: int) -> tuple[str, str]:
         rank = {"slow": 0, "medium": 1, "fast": 2}
@@ -311,9 +301,6 @@ class IntentPlanner:
         if forward_dur >= self._sample("pause_limit", 9.6):
             return MotionPlan("stop", 0, "slow", "hold", "benson:safety_pause")
 
-        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= self._sample("verify_pause", 2.4):
-            return MotionPlan("stop", 0, "slow", "hold", "benson:verify_pause")
-
         if intent.frontier in {"left", "right"}:
             return MotionPlan(intent.frontier, turn_ms, speed_level, "turn", "benson:frontier_turn")
 
@@ -332,9 +319,6 @@ class IntentPlanner:
 
         if intent.hazard == "hard":
             return MotionPlan(self._open_turn(telemetry), turn_ms, "slow", "turn", "sirdavid:careful_reroute")
-
-        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= 1.2:
-            return MotionPlan(self._next_david_turn(), turn_ms, "slow", "turn", "sirdavid:listen_scan")
 
         if intent.novelty == "high" and intent.hazard == "none":
             if forward_dur >= self._sample("reframe", 2.4):
@@ -387,9 +371,6 @@ class IntentPlanner:
             if cycle_count % 5 == 0:
                 arc_turn = opposite
             return MotionPlan(arc_turn, wide_turn_ms, speed_level, "turn", "klaus:signature_arc")
-
-        if bool(telemetry.get("strategy_degraded", False)) and forward_dur >= 1.2:
-            return MotionPlan(preferred_turn, wide_turn_ms, "slow", "turn", "klaus:scan_perimeter")
 
         return MotionPlan("forward", 0, speed_level, "explore", "klaus:perimeter_sweep")
 
@@ -447,25 +428,12 @@ class IntentPlanner:
             and now_ts < self._latched_until_ts
             and not self._can_interrupt_latch(intent, telemetry)
         ):
-            self._register_action(self._latched_plan.action, now_ts)
-            return MotionPlan(
-                action=self._latched_plan.action,
-                duration_ms=self._latched_plan.duration_ms,
-                speed_level=self._latched_plan.speed_level,
-                mode=self._latched_plan.mode,
-                steer=self._latched_plan.steer,
-                reason=f"{self._latched_plan.reason}|latched",
-            )
+            speed, reason = self._scene_speed(self._base_speed(), intent, telemetry, cycle_count)
+            return self.shape_plan(replace(self._latched_plan, speed_level=speed,
+                reason=f"{self._latched_plan.reason}|latched|{reason}"), telemetry, now_ts)
 
         base_speed = self._base_speed()
         speed_level, speed_reason = self._scene_speed(base_speed, intent, telemetry, cycle_count)
-        timeout_plan = self._strategy_timeout_plan(speed_level, telemetry)
-        if timeout_plan:
-            self._latched_plan = None
-            self._latched_until_ts = 0.0
-            self._register_action(timeout_plan.action, now_ts)
-            timeout_plan.reason = f"{timeout_plan.reason}|{speed_reason}"
-            return timeout_plan
 
         if self.persona == "benson":
             plan = self._plan_benson(intent, telemetry, speed_level, now_ts)
@@ -478,16 +446,16 @@ class IntentPlanner:
         else:
             plan = MotionPlan("forward", 0, speed_level, "explore", "default:advance")
 
-        # Continuous proportional steering: shape blind forward bursts into
-        # gentle arcs using the per-cycle side obstacle ratios.
-        if plan.action == "forward" and plan.mode == "explore":
-            plan.steer = self._compute_steer(telemetry)
-            if abs(plan.steer) >= 0.01:
-                plan.reason = f"{plan.reason}|steer{plan.steer:+.2f}"
+        # Ordinary reorientation becomes a gentle arc; obstacle escape stays a pivot.
+        if plan.action in {"left", "right"} and intent.hazard == "none" and intent.frontier != "blocked":
+            side = 0.35 if plan.action == "left" else -0.35
+            plan = replace(plan, action="forward", duration_ms=0, mode="explore", steer=side)
 
         plan = self._maybe_idle_glance(plan, now_ts)
+        self._maneuver_seq += 1
+        plan.maneuver_id = f"persona-{self._maneuver_seq}"
         self._register_action(plan.action, now_ts)
 
         self._latch_plan(plan, now_ts)
         plan.reason = f"{plan.reason}|{speed_reason}"
-        return plan
+        return self.shape_plan(plan, telemetry, now_ts)

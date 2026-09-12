@@ -13,13 +13,19 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 WHEELSON_IP = os.getenv("WHEELSON_IP", "192.168.1.100")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SEC", "0.4"))
+# Older .env files used a 4-second VLM cycle here. The controller now runs
+# independently, and must refresh before its 0.8-second input lease expires.
+LOOP_INTERVAL = max(0.05, min(0.2, float(os.getenv("LOOP_INTERVAL_SEC", "0.1"))))
+CAMERA_INTERVAL_SEC = max(0.05, min(0.4, float(os.getenv("CAMERA_INTERVAL_SEC", "0.15"))))
+PERCEPTION_MAX_AGE_SEC = float(os.getenv("PERCEPTION_MAX_AGE_SEC", "0.8"))
+MOTION_REQUEST_TIMEOUT_SEC = 0.35
+AUTONOMY_RENEWAL_WINDOW_SEC = 0.8
 PORT = int(os.getenv("PORT", "8000"))
 GEMINI_MODEL = "gemini-2.5-flash"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = "llava"
 MAX_LOG_SIZE = 20
-FIRMWARE_VISUAL_SAFETY = os.getenv("FIRMWARE_VISUAL_SAFETY", "False").lower() == "true"
+FIRMWARE_VISUAL_SAFETY = os.getenv("FIRMWARE_VISUAL_SAFETY", "True").lower() == "true"
 
 GEMINI_RPM_LIMIT = 5
 GEMINI_MIN_INTERVAL = 60.0 / GEMINI_RPM_LIMIT
@@ -35,8 +41,7 @@ STRATEGY_TIMEOUT_STAGE2_COUNT = int(os.getenv("STRATEGY_TIMEOUT_STAGE2_COUNT", "
 STRATEGY_TIMEOUT_STAGE3_COUNT = int(os.getenv("STRATEGY_TIMEOUT_STAGE3_COUNT", "3"))
 STRATEGY_LOCAL_ONLY_SEC = float(os.getenv("STRATEGY_LOCAL_ONLY_SEC", "60.0"))
 
-LEASE_HEARTBEAT_SEC = 0.4
-LEASE_MISSED_LIMIT = 3
+LEASE_HEARTBEAT_SEC = 0.2
 # Remote teleop: heartbeat only renews remote motion while commands arrived
 # within this window; afterwards the firmware lease timeout halts the robot.
 REMOTE_RENEWAL_WINDOW_SEC = float(os.getenv("REMOTE_RENEWAL_WINDOW_SEC", "0.7"))
@@ -55,10 +60,7 @@ RECOVERY_EXPECTED_INTERVAL_SEC = float(os.getenv("RECOVERY_EXPECTED_INTERVAL_SEC
 FORWARD_BURST_DEFAULT_MS = int(os.getenv("FORWARD_BURST_DEFAULT_MS", "850"))
 KLAUS_ARC_INTERVAL = int(os.getenv("KLAUS_ARC_INTERVAL", "3"))
 KLAUS_ARC_TURN_MS = int(os.getenv("KLAUS_ARC_TURN_MS", "760"))
-TIMEOUT_SCAN_STEPS = int(os.getenv("TIMEOUT_SCAN_STEPS", "2"))
-TIMEOUT_SCAN_TURN_MS = int(os.getenv("TIMEOUT_SCAN_TURN_MS", "700"))
 PLAN_LATCH_FORWARD_SEC = float(os.getenv("PLAN_LATCH_FORWARD_SEC", "1.8"))
-PLAN_LATCH_TURN_SEC = float(os.getenv("PLAN_LATCH_TURN_SEC", "0.9"))
 
 CONTROL_BUDGET_SEC = float(os.getenv("CONTROL_BUDGET_SEC", "60.0"))
 CONTROL_INACTIVITY_SEC = float(os.getenv("CONTROL_INACTIVITY_SEC", "3.0"))
@@ -165,7 +167,7 @@ PERSONALITIES: dict[str, dict] = {
 
 RESPONSE_SCHEMA = (
     "\n\nIMPORTANT: Respond with ONLY valid JSON \u2014 no markdown fences, no prose before or after.\n"
-    "You are a SCENE INTERPRETER, not a motion planner.\n"
+    "Interpret the scene and propose bounded exploration skills.\n"
     "'observation' must be a SHORT factual description of what the camera shows "
     "(objects/layout/distances/lighting; no personality roleplay).\n"
     "'commentary' must be ONE short sentence in the active persona voice grounded in this frame. "
@@ -175,13 +177,20 @@ RESPONSE_SCHEMA = (
     "Set 'novelty' to one of: low, medium, high (how interesting/new the scene appears).\n"
     "Set 'hazard' to one of: none, soft, hard.\n"
     "Set 'headlight' to true if additional light would improve scene visibility.\n"
+    "Optionally include 'strategy': {'objective': a short goal, 'steps': a list of 1-3 skills}. "
+    "Each step has 'skill', 'direction', and 'duration_s'. Skills: explore (forward/left/right), "
+    "follow_boundary (left/right, only with a visible boundary), scan (left/right), pause (forward). "
+    "Durations are 0.5-6 seconds, except scan which is at most 1 second. "
+    "Use robot-relative directions. Never output wheel values, coordinates, or unobserved targets. "
+    "These are time budgets, not evidence of distance travelled. Prefer continuous exploration arcs. "
+    "Use recent execution outcomes to revise plans; blocked/lost goals need a different approach.\n"
     '{"observation":"A narrow hallway with clear floor and open space ahead.",'
     '"commentary":"Safety bulletin: clear lane ahead; continuing controlled sweep.",'
     '"frontier":"forward","traversability":"high","novelty":"medium","hazard":"none","headlight":false}'
 )
 SCENE_INTERPRETER_PROMPT = (
     "You are the perception layer for a mobile robot. "
-    "Your job is to describe the scene and estimate navigability signals only. "
+    "Describe the scene, choose an exploration objective, and propose feasible local skills. "
     "Do not roleplay in the observation field and do not output motor actions."
 )
 

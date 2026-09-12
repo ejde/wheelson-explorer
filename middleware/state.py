@@ -55,6 +55,10 @@ class AppState:
     last_scene_hazard: str = "none"
     last_scene_observation: str = ""
     last_vlm_commentary: str = ""
+    last_vlm_strategy: dict | None = None
+    last_vlm_frame_id: int = 0
+    last_vlm_capture_ts: float = 0.0
+    executive: dict = field(default_factory=dict)
 
     # Command authority telemetry
     last_command_id: str = "boot"
@@ -72,6 +76,7 @@ class AppState:
     exploration_memory: list = field(default_factory=list)
     event_log: list = field(default_factory=list)
     is_running: bool = False
+    runtime_error: str = ""
 
     # Remote control / queue state
     remote_controller_name: str = ""

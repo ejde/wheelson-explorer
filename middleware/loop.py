@@ -36,7 +36,6 @@ from config import (
     STRATEGY_TIMEOUT_STAGE2_COUNT,
     STRATEGY_TIMEOUT_STAGE3_COUNT,
     STRATEGY_LOCAL_ONLY_SEC,
-    TIMEOUT_SCAN_STEPS,
     CONTROL_BUDGET_SEC,
     CONTROL_INACTIVITY_SEC,
     MOVE_ACTIONS,
@@ -50,15 +49,17 @@ from scene import (
     _frame_signature,
     _motion_score,
     _persona_reactive_thought,
-    _persona_timeout_scan_thought,
     _system_prompt,
     _local_scene_assessment,
     _apply_vlm_semantic_contract,
     build_strategy_intent,
     ask_vlm,
 )
-from motion import MotionSupervisor, MotionResult, WheelsonClient
+from motion import MotionSupervisor, WheelsonClient
 from planner import IntentPlanner
+from perception import CameraStream
+from executive import SkillExecutive
+from skills import observation_is_current
 from recovery import RecoveryController, RecoveryTrigger
 
 log = logging.getLogger("wheelson")
@@ -135,19 +136,20 @@ async def explorer_loop() -> None:
         planner.set_persona(state.personality_key)
         motion = MotionSupervisor(wheelson)
         recovery = RecoveryController()
+        executive = SkillExecutive()
+        camera = CameraStream(wheelson)
+        last_frame_id = 0
+        planning_generation = 0
+        started_at = asyncio.get_running_loop().time()
 
         await motion.start()
 
-        # Initial firmware health check
         try:
-            _, init_telemetry = await wheelson.fetch_frame()
-            log.info(
-                "\u2705 [STARTUP] Firmware health probe OK: nav=%s brightness=%s",
-                init_telemetry.get("nav_state", "UNKNOWN"),
-                init_telemetry.get("brightness", "Unknown"),
-            )
-        except Exception as init_exc:
-            log.warning("\u26a0\ufe0f [STARTUP] Initial firmware health probe failed: %s", init_exc)
+            await camera.start()
+        except BaseException:
+            await camera.close()
+            await motion.close()
+            raise
 
         _state_module._motion_supervisor = motion
 
@@ -176,7 +178,7 @@ async def explorer_loop() -> None:
             state.strategy_mode = "normal"
             state.strategy_degraded_level = 0
 
-        def _register_vlm_timeout(now_ts: float) -> tuple[int, int]:
+        def _register_vlm_timeout(now_ts: float) -> int:
             vlm_timeout_events.append(now_ts)
             _prune_vlm_timeouts(now_ts)
             timeout_count = len(vlm_timeout_events)
@@ -188,21 +190,23 @@ async def explorer_loop() -> None:
             elif timeout_count >= STRATEGY_TIMEOUT_STAGE2_COUNT:
                 stage = 2
 
-            scan_steps = TIMEOUT_SCAN_STEPS + (stage - 1)
-            return stage, scan_steps
+            return stage
 
-        async def request_strategy(frame_bytes: bytes, frame_telemetry: dict) -> dict:
+        async def request_strategy(frame_bytes, frame_telemetry, prompt, generation):
+            request = ask_vlm(frame_bytes, frame_telemetry, prompt, client)
             if _config_module.PROVIDER == "ollama":
-                return await asyncio.wait_for(
-                    ask_vlm(frame_bytes, frame_telemetry, system, client),
-                    timeout=OLLAMA_VLM_TIMEOUT_SEC,
-                )
-            return await ask_vlm(frame_bytes, frame_telemetry, system, client)
+                result = await asyncio.wait_for(request, timeout=OLLAMA_VLM_TIMEOUT_SEC)
+            else:
+                result = await request
+            return dict(result, captured_at=frame_telemetry["captured_at"],
+                        frame_id=frame_telemetry["frame_id"], generation=generation)
 
         async def stop_with_failsafe(reason: str) -> None:
             nonlocal vlm_task, vlm_timeout_events
             log.warning("\U0001f6d1 [FAILSAFE] %s", reason)
             recovery.reset()
+            executive.cancel("failsafe")
+            planner.reset_maneuver()
             vlm_timeout_events = []
             state.strategy_mode = "degraded"
             state.strategy_degraded_level = 2
@@ -220,21 +224,15 @@ async def explorer_loop() -> None:
                 vlm_task = None
             with contextlib.suppress(Exception):
                 await motion.stop_now(source="failsafe", mode="hold")
-            # Health probe: verify firmware is still responding after failsafe stop
-            try:
-                await wheelson.fetch_frame()
-                motion._current_speed = None  # Force re-send on next speed command
-                log.info("\u2705 [FAILSAFE] Firmware health probe OK, speed state reset")
-            except Exception as probe_exc:
-                log.warning("\u26a0\ufe0f [FAILSAFE] Firmware health probe failed: %s", probe_exc)
 
         try:
             while state.is_running:
                 cycle_start = loop.time()
                 try:
-                    jpeg_bytes, telemetry = await wheelson.fetch_frame()
-                    # The camera is mounted upside down; the dashboard rotates
-                    # the image with CSS so no CPU-bound PIL flip on this path.
+                    jpeg_bytes, telemetry = camera.snapshot(loop.time())
+                    new_frame = telemetry["frame_id"] != last_frame_id
+                    telemetry["new_frame"] = new_frame
+                    # Protocol 2 firmware supplies upright frames to every consumer.
                     state.last_frame_b64 = (await asyncio.to_thread(base64.b64encode, jpeg_bytes)).decode()
 
                     state.last_distance_cm = telemetry["distance_cm"]
@@ -246,10 +244,13 @@ async def explorer_loop() -> None:
                     if motion.consume_heartbeat_safety():
                         state.hard_stop_count += 1
 
-                    curr_sig = _frame_signature(jpeg_bytes)
-                    motion_score = _motion_score(state.prev_frame_signature, curr_sig)
-                    state.prev_frame_signature = curr_sig
-                    state.last_motion_score = motion_score
+                    motion_score = state.last_motion_score
+                    if new_frame:
+                        curr_sig = await asyncio.to_thread(_frame_signature, jpeg_bytes)
+                        motion_score = _motion_score(state.prev_frame_signature, curr_sig)
+                        state.prev_frame_signature = curr_sig
+                        state.last_motion_score = motion_score
+                        last_frame_id = telemetry["frame_id"]
                     telemetry["motion_score"] = motion_score
 
                     now_ts = loop.time()
@@ -264,6 +265,11 @@ async def explorer_loop() -> None:
                     if _new_persona and _new_persona in PERSONALITIES:
                         state.personality_key = _new_persona
                         planner.set_persona(_new_persona)
+                        planning_generation += 1
+                        executive.cancel("persona_changed")
+                        state.last_vlm_strategy = None
+                        state.last_strategy_update_ts = 0.0
+                        state.semantic_pending_hard = state.semantic_pending_blocked = 0
                         recovery.reset()
                         system = _system_prompt(_new_persona)
                         personality = PERSONALITIES[_new_persona]
@@ -277,6 +283,7 @@ async def explorer_loop() -> None:
                     async with _queue_lock:
                         while _control_queue and (now_ts - _control_queue[0].joined_at) > CONTROL_BUDGET_SEC:
                             expired_sess = _control_queue.pop(0)
+                            await motion.release_remote()
                             log.info("\U0001f3ae [REMOTE] Session expired for '%s'", expired_sess.name)
                         state.remote_queue_length = len(_control_queue)
                         if _control_queue:
@@ -295,13 +302,16 @@ async def explorer_loop() -> None:
                             state.remote_is_active = False
 
                     fresh_observation = ""
-                    strategy_timeout_event = False
-                    timeout_scan_steps = TIMEOUT_SCAN_STEPS
 
                     # Consume completed VLM task
                     if vlm_task and vlm_task.done():
                         try:
                             vlm_update = vlm_task.result()
+                            if not observation_is_current(vlm_update, planning_generation, now_ts, SEMANTIC_TTL_SEC):
+                                raise VLMResponseError("Discarded stale observation or persona generation", "")
+                            state.last_vlm_strategy = None if motion.remote_owned else vlm_update.get("strategy")
+                            state.last_vlm_frame_id = vlm_update["frame_id"]
+                            state.last_vlm_capture_ts = vlm_update["captured_at"]
                             vetted_scene, semantic_conf, contract_note = _apply_vlm_semantic_contract(vlm_update, telemetry)
                             vlm_backoff_until_ts = 0.0
                             state.last_vlm_headlight_pref = vetted_scene.get("headlight", False)
@@ -315,7 +325,7 @@ async def explorer_loop() -> None:
                                 state.last_vlm_commentary = incoming_commentary
                             state.semantic_confidence = semantic_conf
                             state.last_strategy_source = "vlm"
-                            state.last_strategy_update_ts = now_ts
+                            state.last_strategy_update_ts = vlm_update["captured_at"]
                             fresh_observation = state.last_scene_observation
                             vlm_timeout_events = []
                             log.info(
@@ -333,7 +343,7 @@ async def explorer_loop() -> None:
                                     "\U0001f916 [VLM] ollama refresh timed out after %.1fs; keeping previous strategy",
                                     OLLAMA_VLM_TIMEOUT_SEC,
                                 )
-                                stage, timeout_scan_steps = _register_vlm_timeout(now_ts)
+                                stage = _register_vlm_timeout(now_ts)
                                 if stage >= 3:
                                     log.warning(
                                         "\U0001f916 [VLM] timeout escalation -> local_only for %.0fs (count=%d)",
@@ -341,7 +351,6 @@ async def explorer_loop() -> None:
                                         len(vlm_timeout_events),
                                     )
                                 vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + OLLAMA_TIMEOUT_BACKOFF_SEC)
-                                strategy_timeout_event = True
                             else:
                                 log.warning("\U0001f916 [VLM] gemini request timed out; switching to local scene fallback")
                                 vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + strategy_refresh_interval)
@@ -387,7 +396,7 @@ async def explorer_loop() -> None:
                         )
                     )
                     if should_refresh_vlm:
-                        vlm_task = asyncio.create_task(request_strategy(bytes(jpeg_bytes), dict(telemetry)))
+                        vlm_task = asyncio.create_task(request_strategy(bytes(jpeg_bytes), dict(telemetry), system, planning_generation))
                         last_vlm_request_ts = now_ts
 
                     strategy_age = (
@@ -398,7 +407,7 @@ async def explorer_loop() -> None:
                     strategy_semantic_expired = (
                         state.last_strategy_update_ts <= 0.0 or strategy_age >= SEMANTIC_TTL_SEC
                     )
-                    if strategy_semantic_expired:
+                    if strategy_semantic_expired or state.last_strategy_source != "vlm":
                         local_scene = _local_scene_assessment(telemetry)
                         prev_source = state.last_strategy_source
                         state.last_vlm_headlight_pref = local_scene["headlight"]
@@ -426,8 +435,6 @@ async def explorer_loop() -> None:
 
                     _update_strategy_mode(now_ts)
 
-                    telemetry["strategy_timeout_event"] = strategy_timeout_event
-                    telemetry["timeout_scan_steps"] = timeout_scan_steps
                     telemetry["strategy_source"] = state.last_strategy_source
                     telemetry["strategy_age_sec"] = strategy_age if strategy_age != float("inf") else 999.0
                     telemetry["strategy_mode"] = state.strategy_mode
@@ -460,25 +467,25 @@ async def explorer_loop() -> None:
                         await motion.sync_headlight(desired_headlight, source="planner")
                         state.last_headlight = desired_headlight
 
+                    if state.last_vlm_strategy is not None:
+                        executive.submit(state.last_vlm_frame_id, state.last_vlm_strategy,
+                            state.last_vlm_capture_ts + SEMANTIC_TTL_SEC, now_ts)
+
                     # -- S5: Human Override --
-                    if state.remote_is_active:
+                    if state.remote_is_active or motion.remote_owned:
                         if not _remote_was_active:
-                            # Transition: halt any ongoing autonomous motion
-                            await motion.stop_now(source="remote", mode="manual")
+                            # remote_move already atomically took ownership; do not stop its first input.
+                            planner.reset_maneuver()
+                            executive.cancel("human_takeover")
+                            planning_generation += 1
+                            state.last_vlm_strategy = None
+                            state.last_strategy_update_ts = 0.0
                             recovery.reset()
                             _remote_was_active = True
                             log.info("\U0001f3ae [REMOTE] %s took control", state.remote_controller_name)
                         # Keep displaying the last autonomous thought while human drives
-                        result = MotionResult(
-                            action=state.last_action,
-                            duration_ms=0,
-                            safety=False,
-                            busy=False,
-                            command_id=state.last_command_id,
-                            source="remote",
-                            mode="manual",
-                        )
-                        actual_action = state.last_action
+                        result = motion.last_result
+                        actual_action = result.action
                         actual_duration = 0
                         plan_speed = "remote"
                         plan_reason = "remote_override"
@@ -487,15 +494,16 @@ async def explorer_loop() -> None:
                         if _remote_was_active:
                             _remote_was_active = False
                             # Halt any residual remote motion before autonomy resumes.
-                            await motion.stop_now(source="remote_release", mode="manual")
+                            await motion.release_remote(only_if_inactive=True)
+                            planner.reset_maneuver()
+                            planning_generation += 1
+                            state.last_vlm_strategy = None
+                            state.last_strategy_update_ts = 0.0
                             log.info("\U0001f916 [REMOTE] Autonomy resumed after '%s'", state.remote_controller_name)
 
                         trigger: RecoveryTrigger | None = None
-                        if not strategy_timeout_event:
-                            tracking_forward = (
-                                state.last_action == "forward"
-                                or motion.active_continuous_action in ("forward", "drive")
-                            )
+                        if new_frame and not motion.recovery_active:
+                            tracking_forward = motion.tracking_forward
                             trigger = recovery.observe(
                                 tracking_forward=tracking_forward,
                                 motion_score=motion_score,
@@ -506,7 +514,16 @@ async def explorer_loop() -> None:
                         plan_speed = "medium"
                         plan_reason = "recovery"
 
-                        if trigger:
+                        if motion.recovery_active:
+                            recovery.pause_tracking()
+                            result = await motion.advance_recovery()
+                            actual_action, actual_duration = result.action, result.duration_ms
+                            plan_reason = "recovery:running"
+                        elif trigger:
+                            executive.cancel("recovery")
+                            planning_generation += 1
+                            state.last_vlm_strategy = None
+                            planner.reset_maneuver()
                             reactive_thought = _persona_reactive_thought(state.personality_key, trigger.level)
                             result = await motion.execute_recovery(
                                 level=trigger.level,
@@ -522,27 +539,38 @@ async def explorer_loop() -> None:
                             plan_speed = "medium"
                             plan_reason = f"recovery:{trigger.level}"
                         else:
-                            plan = planner.plan(intent, telemetry, state.cycle_count, now_ts)
-                            fallback_plan = plan.reason.startswith("gate:strategist_timeout")
-                            source = "strategist_fallback" if fallback_plan else intent.source
-                            result = await motion.apply_plan(plan, source=source)
-                            if fallback_plan:
-                                state.last_thought = _persona_timeout_scan_thought(state.personality_key)
-                                state.last_strategy_source = "fallback"
-                                state.last_strategy_update_ts = loop.time()
-                                state.semantic_confidence = min(state.semantic_confidence, 0.5)
+                            # Preserve startup timing despite the faster controller cadence.
+                            planning_cycle = int((now_ts - started_at) / 0.4)
+                            speed, _ = planner._scene_speed(planner._base_speed(), intent, telemetry, planning_cycle)
+                            plan = executive.tick(intent, telemetry, now_ts, speed)
+                            if plan is None:
+                                if motion.active_source == "skill":
+                                    planner.reset_maneuver()
+                                plan = planner.plan(intent, telemetry, planning_cycle, now_ts)
                             else:
-                                state.last_thought = intent.thought
+                                plan = planner.shape_plan(plan, telemetry, now_ts)
+                            source = "skill" if plan.reason.startswith("skill:") else intent.source
+                            result = await motion.apply_plan(plan, source=source)
+                            state.last_thought = intent.thought
                             actual_action = result.action
                             actual_duration = result.duration_ms
                             plan_speed = plan.speed_level
                             plan_reason = plan.reason
 
+                    state.executive = executive.snapshot()
+                    if state.executive["objective"]:
+                        state.last_objective = state.executive["objective"]
                     _update_strategy_mode(loop.time())
 
                     if result.safety:
                         state.hard_stop_count += 1
                         recovery.reset()
+                    if result.safety or result.busy:
+                        executive.cancel("firmware_rejected")
+                        planner.reset_maneuver()
+                        planning_generation += 1
+                        state.last_vlm_strategy = None
+                        state.executive = executive.snapshot()
 
                     # Streak counts distinct motion commands, not latch repeats.
                     new_command_id = result.command_id or ""
@@ -570,7 +598,8 @@ async def explorer_loop() -> None:
                     state.speed_cap_level = plan_speed
                     state.speed_cap_reason = plan_reason
 
-                    if intent.observation:
+                    if intent.observation and (fresh_observation or not state.exploration_memory or
+                            intent.observation != state.exploration_memory[-1]["observation"]):
                         mem_entry = {
                             "ts": datetime.now().strftime("%H:%M:%S"),
                             "action": actual_action,
@@ -628,6 +657,10 @@ async def explorer_loop() -> None:
                             "command_id": state.last_command_id,
                             "command_source": state.last_command_source,
                             "command_mode": state.last_command_mode,
+                            "executive": state.executive,
+                            "perception_age_s": round(now_ts - telemetry["captured_at"], 3),
+                            "wheel_output": telemetry.get("wheel_output", []),
+                            "wheel_target": telemetry.get("wheel_target", []),
                             "scene_frontier": intent.frontier,
                             "scene_traversability": intent.traversability,
                             "scene_novelty": intent.novelty,
@@ -695,4 +728,6 @@ async def explorer_loop() -> None:
                 vlm_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await vlm_task
+            await camera.close()
             await motion.close()
+            _state_module._motion_supervisor = None
