@@ -27,6 +27,9 @@ from config import (
     MAX_LOG_SIZE,
     FAILSAFE_BACKOFF_SEC,
     GEMINI_MIN_INTERVAL,
+    OPENROUTER_STRATEGY_MIN_INTERVAL,
+    OPENROUTER_VLM_TIMEOUT_SEC,
+    OPENROUTER_TIMEOUT_BACKOFF_SEC,
     OLLAMA_STRATEGY_MIN_INTERVAL,
     OLLAMA_VLM_TIMEOUT_SEC,
     OLLAMA_TIMEOUT_BACKOFF_SEC,
@@ -117,9 +120,11 @@ async def explorer_loop() -> None:
     state.vlm_timeout_count = 0
     state.vlm_disabled_until_ts = 0.0
 
-    strategy_refresh_interval = (
-        GEMINI_MIN_INTERVAL if _config_module.PROVIDER == "gemini" else OLLAMA_STRATEGY_MIN_INTERVAL
-    )
+    strategy_refresh_interval = {
+        "gemini": GEMINI_MIN_INTERVAL,
+        "openrouter": OPENROUTER_STRATEGY_MIN_INTERVAL,
+        "ollama": OLLAMA_STRATEGY_MIN_INTERVAL,
+    }[_config_module.PROVIDER]
     strategy_stale_interval = strategy_refresh_interval * STRATEGY_STALE_MULTIPLIER
 
     log.info(
@@ -194,10 +199,11 @@ async def explorer_loop() -> None:
 
         async def request_strategy(frame_bytes, frame_telemetry, prompt, generation):
             request = ask_vlm(frame_bytes, frame_telemetry, prompt, client)
-            if _config_module.PROVIDER == "ollama":
-                result = await asyncio.wait_for(request, timeout=OLLAMA_VLM_TIMEOUT_SEC)
-            else:
-                result = await request
+            provider_timeout = {
+                "openrouter": OPENROUTER_VLM_TIMEOUT_SEC,
+                "ollama": OLLAMA_VLM_TIMEOUT_SEC,
+            }.get(_config_module.PROVIDER)
+            result = await asyncio.wait_for(request, timeout=provider_timeout) if provider_timeout else await request
             return dict(result, captured_at=frame_telemetry["captured_at"],
                         frame_id=frame_telemetry["frame_id"], generation=generation)
 
@@ -338,10 +344,21 @@ async def explorer_loop() -> None:
                             if contract_note != "ok":
                                 log.info("\U0001f9e0 [SEMANTIC_CONTRACT] %s (conf=%.2f)", contract_note, semantic_conf)
                         except asyncio.TimeoutError:
-                            if _config_module.PROVIDER == "ollama":
+                            if _config_module.PROVIDER in {"ollama", "openrouter"}:
+                                timeout_sec = (
+                                    OPENROUTER_VLM_TIMEOUT_SEC
+                                    if _config_module.PROVIDER == "openrouter"
+                                    else OLLAMA_VLM_TIMEOUT_SEC
+                                )
+                                timeout_backoff = (
+                                    OPENROUTER_TIMEOUT_BACKOFF_SEC
+                                    if _config_module.PROVIDER == "openrouter"
+                                    else OLLAMA_TIMEOUT_BACKOFF_SEC
+                                )
                                 log.warning(
-                                    "\U0001f916 [VLM] ollama refresh timed out after %.1fs; keeping previous strategy",
-                                    OLLAMA_VLM_TIMEOUT_SEC,
+                                    "\U0001f916 [VLM] %s refresh timed out after %.1fs; keeping previous strategy",
+                                    _config_module.PROVIDER,
+                                    timeout_sec,
                                 )
                                 stage = _register_vlm_timeout(now_ts)
                                 if stage >= 3:
@@ -350,7 +367,7 @@ async def explorer_loop() -> None:
                                         STRATEGY_LOCAL_ONLY_SEC,
                                         len(vlm_timeout_events),
                                     )
-                                vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + OLLAMA_TIMEOUT_BACKOFF_SEC)
+                                vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + timeout_backoff)
                             else:
                                 log.warning("\U0001f916 [VLM] gemini request timed out; switching to local scene fallback")
                                 vlm_backoff_until_ts = max(vlm_backoff_until_ts, now_ts + strategy_refresh_interval)

@@ -24,7 +24,10 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from state import state
-from config import PERSONALITIES, GEMINI_API_KEY, GEMINI_MODEL, OLLAMA_MODEL, PORT
+from config import (
+    PERSONALITIES, GEMINI_API_KEY, GEMINI_MODEL, OPENROUTER_API_KEY,
+    OPENROUTER_MODEL, OLLAMA_MODEL, PORT,
+)
 import config as _config_module
 from loop import explorer_loop
 from routes import dashboard, sse_stream, snapshot, health
@@ -154,15 +157,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["gemini", "ollama"],
+        choices=["gemini", "openrouter", "ollama"],
         default="gemini",
-        help="VLM provider: 'gemini' (cloud) or 'ollama' (local). Default: gemini",
+        help="VLM provider: 'gemini', 'openrouter' (cloud), or 'ollama' (local). Default: gemini",
     )
     parser.add_argument(
         "--model",
         default=None,
         metavar="MODEL",
-        help="Model name override. Defaults: gemini=gemini-2.5-flash, ollama=llava",
+        help="Model name override. Defaults: gemini=gemini-2.5-flash, openrouter=qwen/qwen3-vl-30b-a3b-instruct, ollama=llava",
     )
     parser.add_argument("--port", type=int, default=PORT, help="Dashboard port (default: 8000)")
     args = parser.parse_args()
@@ -172,11 +175,17 @@ def main() -> None:
         _config_module.ACTIVE_MODEL = args.model
     elif _config_module.PROVIDER == "gemini":
         _config_module.ACTIVE_MODEL = GEMINI_MODEL
+    elif _config_module.PROVIDER == "openrouter":
+        _config_module.ACTIVE_MODEL = OPENROUTER_MODEL
     else:
         _config_module.ACTIVE_MODEL = OLLAMA_MODEL
 
     if _config_module.PROVIDER == "gemini" and not GEMINI_API_KEY:
         log.error("\u274c GEMINI_API_KEY is not set. Add it to your .env file and retry.")
+        sys.exit(1)
+
+    if _config_module.PROVIDER == "openrouter" and not OPENROUTER_API_KEY:
+        log.error("OPENROUTER_API_KEY is not set. Add it to your .env file and retry.")
         sys.exit(1)
 
     state.personality_key = args.personality

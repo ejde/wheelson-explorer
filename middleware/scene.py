@@ -19,6 +19,8 @@ from PIL import Image
 from state import state
 from config import (
     GEMINI_API_KEY,
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
     OLLAMA_BASE_URL,
     RESPONSE_SCHEMA,
     SCENE_INTERPRETER_PROMPT,
@@ -686,6 +688,45 @@ async def _ask_ollama(
     return resp.json()["response"].strip()
 
 
+async def _ask_openrouter(
+    jpeg_bytes: bytes,
+    telemetry: dict,
+    system: str,
+    http_client: httpx.AsyncClient,
+) -> str:
+    """Request structured visual semantics through OpenRouter's vision API."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+    image_b64 = base64.b64encode(jpeg_bytes).decode()
+    payload = {
+        "model": _config_module.ACTIVE_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _build_prompt(telemetry)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                ],
+            },
+        ],
+        "temperature": 0.4,
+        "max_tokens": 700,
+    }
+    response = await http_client.post(
+        f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+        json=payload,
+        timeout=20.0,
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    if not isinstance(content, str):
+        raise VLMResponseError("OpenRouter returned non-text content", repr(content))
+    return content.strip()
+
+
 async def ask_vlm(
     jpeg_bytes: bytes,
     telemetry: dict,
@@ -694,6 +735,8 @@ async def ask_vlm(
 ) -> dict:
     if _config_module.PROVIDER == "gemini":
         raw = await _ask_gemini(jpeg_bytes, telemetry, system)
+    elif _config_module.PROVIDER == "openrouter":
+        raw = await _ask_openrouter(jpeg_bytes, telemetry, system, http_client)
     else:
         raw = await _ask_ollama(jpeg_bytes, telemetry, system, http_client)
 

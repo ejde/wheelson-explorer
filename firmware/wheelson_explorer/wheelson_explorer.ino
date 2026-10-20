@@ -39,8 +39,17 @@
 
 // ─── USER CONFIGURATION ──────────────────────────────────────────────────────
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+
+#ifndef WIFI_SSID
 #define WIFI_SSID "WIFI_SSID"
+#endif
+
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD "WIFI_PASSWORD"
+#endif
 
 // HC-SR04 distance sensor (must stay on 13/12 due to hardware limits)
 #define TRIG_PIN 13
@@ -468,13 +477,12 @@ float readDistanceCM() {
 // ─── HYBRID EDGE AI (VISUAL OBSTACLE DETECTION) ──────────────────────────────
 
 /**
- * Perform a fast pixel-level analysis of a QQVGA (160x120) RGB565 frame buffer.
+ * Perform a fast pixel-level analysis of a QQVGA (160x120) RGB888 frame buffer.
  * Estimates floor obstacles by comparing lookahead color to safe floor color.
  * Uses an EMA on ratios, a latched decision with hysteresis, and a rolling
  * floor-color reference that only updates while the frame looks clear.
  */
-void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
-  uint16_t *pixels = (uint16_t *)rgb565_pixels;
+void analyzeFrame(uint8_t *rgb888_pixels, int width, int height) {
   long r_sum = 0, g_sum = 0, b_sum = 0;
   int safe_count = 0;
 
@@ -483,11 +491,11 @@ void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
   // nose/wires
   for (int y = height - 40; y < height - 15; y++) {
     for (int x = width / 2 - 20; x < width / 2 + 20; x++) {
-      uint16_t p = pixels[y * width + x];
-      // RGB565 unpack: R(5), G(6), B(5)
-      r_sum += (p >> 11) & 0x1F;
-      g_sum += (p >> 5) & 0x3F;
-      b_sum += p & 0x1F;
+      size_t offset = (y * width + x) * 3;
+      // Preserve the existing RGB565-scale tuning while decoding RGB888.
+      r_sum += rgb888_pixels[offset] >> 3;
+      g_sum += rgb888_pixels[offset + 1] >> 2;
+      b_sum += rgb888_pixels[offset + 2] >> 3;
       safe_count++;
     }
   }
@@ -527,10 +535,10 @@ void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
   for (int y = (height / 2) - 10; y < height - 40; y += 2) {
     for (int x = 40; x < width - 40;
          x += 2) { // 40-pixel inset to skip dark vignetting
-      uint16_t p = pixels[y * width + x];
-      int r = (p >> 11) & 0x1F;
-      int g = (p >> 5) & 0x3F;
-      int b = p & 0x1F;
+      size_t offset = (y * width + x) * 3;
+      int r = rgb888_pixels[offset] >> 3;
+      int g = rgb888_pixels[offset + 1] >> 2;
+      int b = rgb888_pixels[offset + 2] >> 3;
 
       look_r_sum += r;
       look_g_sum += g;
@@ -612,7 +620,9 @@ void analyzeFrame(uint8_t *rgb565_pixels, int width, int height) {
 // ─── CAMERA ──────────────────────────────────────────────────────────────────
 
 bool initCamera() {
-  camera_config_t config;
+  // The ESP32 camera config gained fields in recent Arduino-ESP32 cores.
+  // Zero-initialize it so those fields never carry stack garbage.
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -627,16 +637,29 @@ bool initCamera() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+#else
   config.pin_sscb_sda = SIOD_GPIO_NUM;
   config.pin_sscb_scl = SIOC_GPIO_NUM;
+#endif
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 18000000;
+  // Wheelson's camera module is unreliable above 10 MHz; a lower clock avoids
+  // DMA frame-buffer overruns on this wiring revision.
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_QQVGA; // 160×120 — small & fast
   config.jpeg_quality = 10;            // 10 = high quality (lower = better)
-  config.fb_count = 1;
+  // The capture DMA continues while frame analysis is running. Use two PSRAM
+  // buffers and keep the newest completed image so it cannot overrun a single
+  // held buffer (cam_hal: FB-OVF).
+  config.fb_count = 2;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   config.fb_location = CAMERA_FB_IN_PSRAM; // requires Tools → PSRAM → Enabled
+  config.grab_mode = CAMERA_GRAB_LATEST;
+#endif
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -1030,8 +1053,8 @@ void setup() {
       delay(1000);
   }
 
-  // Allocate PSRAM buffer for RGB565 decoding
-  visual_rgb_buf = (uint8_t *)ps_malloc(160 * 120 * 2);
+  // Allocate PSRAM buffer for RGB888 decoding.
+  visual_rgb_buf = (uint8_t *)ps_malloc(160 * 120 * 3);
   if (!visual_rgb_buf) {
     Serial.println("[ERROR] Failed to allocate visual_rgb_buf in PSRAM");
   }
@@ -1075,7 +1098,7 @@ void loop() {
     if (visual_rgb_buf) {
       camera_fb_t *fb = esp_camera_fb_get();
       if (fb) {
-        if (jpg2rgb565(fb->buf, fb->len, visual_rgb_buf, JPG_SCALE_NONE)) {
+        if (fmt2rgb888(fb->buf, fb->len, fb->format, visual_rgb_buf)) {
           analyzeFrame(visual_rgb_buf, fb->width, fb->height);
           lastSuccessfulAnalysisTime = millis();
           hasAnalysis = true;

@@ -13,6 +13,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 WHEELSON_IP = os.getenv("WHEELSON_IP", "192.168.1.100")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # Older .env files used a 4-second VLM cycle here. The controller now runs
 # independently, and must refresh before its 0.8-second input lease expires.
 LOOP_INTERVAL = max(0.05, min(0.2, float(os.getenv("LOOP_INTERVAL_SEC", "0.1"))))
@@ -22,6 +23,8 @@ MOTION_REQUEST_TIMEOUT_SEC = 0.35
 AUTONOMY_RENEWAL_WINDOW_SEC = 0.8
 PORT = int(os.getenv("PORT", "8000"))
 GEMINI_MODEL = "gemini-2.5-flash"
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-vl-30b-a3b-instruct")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = "llava"
 MAX_LOG_SIZE = 20
@@ -29,6 +32,9 @@ FIRMWARE_VISUAL_SAFETY = os.getenv("FIRMWARE_VISUAL_SAFETY", "True").lower() == 
 
 GEMINI_RPM_LIMIT = 5
 GEMINI_MIN_INTERVAL = 60.0 / GEMINI_RPM_LIMIT
+OPENROUTER_STRATEGY_MIN_INTERVAL = float(os.getenv("OPENROUTER_STRATEGY_MIN_INTERVAL_SEC", "8.0"))
+OPENROUTER_VLM_TIMEOUT_SEC = float(os.getenv("OPENROUTER_VLM_TIMEOUT_SEC", "20.0"))
+OPENROUTER_TIMEOUT_BACKOFF_SEC = float(os.getenv("OPENROUTER_TIMEOUT_BACKOFF_SEC", "12.0"))
 OLLAMA_STRATEGY_MIN_INTERVAL = float(os.getenv("OLLAMA_STRATEGY_MIN_INTERVAL_SEC", "8.0"))
 OLLAMA_VLM_TIMEOUT_SEC = float(os.getenv("OLLAMA_VLM_TIMEOUT_SEC", "14.0"))
 OLLAMA_TIMEOUT_BACKOFF_SEC = float(os.getenv("OLLAMA_TIMEOUT_BACKOFF_SEC", "24.0"))
@@ -104,7 +110,7 @@ MOVE_ACTIONS = {"forward", "backward", "left", "right"}
 ALL_ACTIONS = MOVE_ACTIONS | {"stop"}
 
 # Set at startup from CLI args
-PROVIDER: str = "gemini"  # "gemini" | "ollama"
+PROVIDER: str = "gemini"  # "gemini" | "openrouter" | "ollama"
 ACTIVE_MODEL: str = GEMINI_MODEL
 
 # ---------------------------------------------------------------------------

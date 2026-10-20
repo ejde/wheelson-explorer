@@ -29,6 +29,8 @@ from config import (
     ALL_ACTIONS,
     CONTROL_BUDGET_SEC,
     GEMINI_API_KEY,
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
     OLLAMA_BASE_URL,
 )
 from scene import _exc_summary
@@ -100,6 +102,26 @@ async def _chat_response(message: str, name: str) -> str:
             ),
         )
         return resp.text.strip()
+    if _config_module.PROVIDER == "openrouter":
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                json={
+                    "model": _config_module.ACTIVE_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.8,
+                    "max_tokens": 180,
+                },
+                timeout=20.0,
+            )
+            resp.raise_for_status()
+            return str(resp.json()["choices"][0]["message"]["content"]).strip()
     else:
         async with httpx.AsyncClient() as http:
             resp = await http.post(

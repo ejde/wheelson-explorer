@@ -10,6 +10,8 @@ build/
 # ─── Environment (never commit secrets) ───────────────────────────────────────
 middleware/.env
 .env
+firmware/**/secrets.h
+firmware/**/credentials.h
 
 # ─── macOS ───────────────────────────────────────────────────────────────────
 .DS_Store
