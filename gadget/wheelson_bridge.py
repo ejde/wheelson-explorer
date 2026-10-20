@@ -39,7 +39,9 @@ Every command prints one JSON object: {"ok": true, "payload": {...}} or
 
 Config via environment:
     WHEELSON_MIDDLEWARE_URL  default http://127.0.0.1:8000
-    WHEELSON_GADGET_NAME     queue display name, default "Finch"
+    WHEELSON_GADGET_NAME     queue display name, default "Muse" — set this
+                             to your own Muse's name (it joins the queue
+                             and chats under this name)
     WHEELSON_STATE_DIR       default ~/.wheelson-gadget
     WHEELSON_SNAPSHOT_DIR    default ~/wheelson-snapshots
 """
@@ -55,7 +57,7 @@ import urllib.request
 from pathlib import Path
 
 MIDDLEWARE_URL = os.environ.get("WHEELSON_MIDDLEWARE_URL", "http://127.0.0.1:8000").rstrip("/")
-GADGET_NAME = os.environ.get("WHEELSON_GADGET_NAME", "Finch")
+GADGET_NAME = os.environ.get("WHEELSON_GADGET_NAME", "Muse")
 STATE_DIR = Path(os.environ.get("WHEELSON_STATE_DIR", Path.home() / ".wheelson-gadget"))
 SNAPSHOT_DIR = Path(os.environ.get("WHEELSON_SNAPSHOT_DIR", Path.home() / "wheelson-snapshots"))
 
@@ -101,6 +103,13 @@ def _request(method: str, path: str, body: dict | None = None, timeout: float = 
         ) from exc
     except urllib.error.URLError as exc:
         raise MiddlewareError(f"middleware unreachable at {MIDDLEWARE_URL}: {exc.reason}") from exc
+    except OSError as exc:
+        # TimeoutError / ConnectionError raised while *reading* a response
+        # (e.g. the middleware accepted a control pulse but its reply was
+        # delayed or lost) are OSErrors, not URLErrors. Convert them too,
+        # so callers' cleanup paths (notably drive's best-effort stop)
+        # actually run instead of being skipped by an escaping exception.
+        raise MiddlewareError(f"middleware request to {path} failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -133,25 +142,57 @@ def _clear_token() -> None:
 
 
 def _ensure_token() -> str:
-    """Return a live queue token, joining (or re-joining) if needed."""
+    """Return the cached queue token, joining only if there is none.
+
+    No liveness probe: the middleware answers 403 for two different
+    states — `not_your_turn` (token valid, someone else is driving) and
+    `session_expired` (token dead) — so a probe cannot tell them apart,
+    and clearing a valid `not_your_turn` token would strand the session
+    (re-join then fails 409 `already_in_queue`, and `leave` has no token
+    to remove it with). Validity is therefore decided where the error
+    occurs: `_control` clears the token only on `session_expired`.
+    """
     token = _load_token()
     if token:
-        # Cheap liveness check: we are controller only if queue head is us.
-        # queue_status doesn't expose tokens, so instead probe with a
-        # harmless `stop` — the middleware answers not_your_turn (403) if
-        # the cached token is stale/expired. A stop when it IS our turn is
-        # a no-op safety-wise.
-        try:
-            _request("POST", "/control", {"token": token, "direction": "stop"})
-            return token
-        except MiddlewareError as exc:
-            if exc.status != 403:
-                raise
-            _clear_token()
-    _, payload = _request("POST", "/queue/join", {"name": GADGET_NAME})
+        return token
+    try:
+        _, payload = _request("POST", "/queue/join", {"name": GADGET_NAME})
+    except MiddlewareError as exc:
+        if exc.payload.get("error") == "already_in_queue":
+            raise MiddlewareError(
+                f"a queue session named {GADGET_NAME!r} already exists but its "
+                "token is not cached here (state file lost?). It clears when "
+                "its queue budget expires (60 s default); wait, or set "
+                "WHEELSON_GADGET_NAME to a different name."
+            ) from exc
+        raise
     token = payload["token"]
     _save_token(token)
     return token
+
+
+def _control(token: str, direction: str) -> dict:
+    """POST /control, maintaining token state from the error semantics.
+
+    `session_expired` is the only response that proves the token is dead,
+    so it is the only one that clears the cache. `not_your_turn` keeps the
+    token: the session is still queued and `leave` still needs it.
+    """
+    try:
+        _, payload = _request("POST", "/control", {"token": token, "direction": direction})
+        return payload
+    except MiddlewareError as exc:
+        err = exc.payload.get("error")
+        if err == "session_expired":
+            _clear_token()
+        elif err == "not_your_turn":
+            raise MiddlewareError(
+                "not_your_turn: another controller is driving; this gadget's "
+                "queue session is still valid (see wheelson.queue_status)",
+                status=exc.status,
+                payload=exc.payload,
+            ) from exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -200,27 +241,28 @@ def cmd_drive(params: dict) -> dict:
 
     token = _ensure_token()
     if direction == "stop":
-        _request("POST", "/control", {"token": token, "direction": "stop"})
+        _control(token, "stop")
         return {"ok": True, "direction": "stop", "pulses": 1}
 
     sent = 0
     try:
         for i in range(repeats):
-            _request("POST", "/control", {"token": token, "direction": direction})
+            _control(token, direction)
             sent += 1
             if i < repeats - 1:
                 time.sleep(PULSE_INTERVAL_SEC)
     except MiddlewareError:
-        # Any failure mid-train: try to stop before surfacing the error.
+        # Any failure mid-train (including a converted timeout — P2):
+        # try to stop before surfacing the error.
         try:
-            _request("POST", "/control", {"token": token, "direction": "stop"})
+            _control(token, "stop")
         except MiddlewareError:
             pass
         raise
     # Deterministic end state: stopped. Motion would also lapse on its own
     # via the middleware renewal window + firmware watchdog, but don't rely
     # on a timeout for something we can close explicitly.
-    _request("POST", "/control", {"token": token, "direction": "stop"})
+    _control(token, "stop")
     return {"direction": direction, "pulses": sent, "ended": "stop"}
 
 

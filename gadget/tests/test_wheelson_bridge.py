@@ -33,6 +33,7 @@ class FakeMiddleware(BaseHTTPRequestHandler):
     controls = []       # list of directions received, in order
     persona = "benson"
     token_counter = 0
+    expired_tokens = set()  # tokens that answer 403 session_expired
 
     def log_message(self, *args):  # silence
         pass
@@ -83,6 +84,8 @@ class FakeMiddleware(BaseHTTPRequestHandler):
             self.queue.append({"token": token, "name": name})
             self._json(200, {"token": token, "position": len(self.queue), "budget_sec": 60.0})
         elif self.path == "/control":
+            if body.get("token") in FakeMiddleware.expired_tokens:
+                return self._json(403, {"error": "session_expired"})
             if not self.queue or self.queue[0]["token"] != body.get("token"):
                 return self._json(403, {"error": "not_your_turn"})
             if body.get("direction") not in ACTIONS:
@@ -131,6 +134,7 @@ class BridgeTest(unittest.TestCase):
         FakeMiddleware.queue = []
         FakeMiddleware.controls = []
         FakeMiddleware.persona = "benson"
+        FakeMiddleware.expired_tokens = set()
         self.bridge._clear_token()
 
     def test_health_trims_fields(self):
@@ -153,18 +157,69 @@ class BridgeTest(unittest.TestCase):
     def test_drive_pulses_then_stops_and_reuses_token(self):
         r = self.bridge.run_command("drive", {"direction": "forward", "repeats": 3})
         self.assertTrue(r["ok"], r)
-        # fresh join (no probe) + 3 pulses + final stop
+        # fresh join + 3 pulses + final stop (no probe traffic)
         self.assertEqual(FakeMiddleware.controls, ["forward", "forward", "forward", "stop"])
         token_file = self.bridge._state_path()
         self.assertTrue(token_file.exists())
         self.assertEqual(oct(token_file.stat().st_mode)[-3:], "600")
-        # Second drive reuses the cached token: probe stop + pulse + final stop,
+        # Second drive reuses the cached token: pulse + final stop,
         # and no second join (queue still holds exactly one session)
         FakeMiddleware.controls = []
         r = self.bridge.run_command("drive", {"direction": "left", "repeats": 1})
         self.assertTrue(r["ok"], r)
-        self.assertEqual(FakeMiddleware.controls, ["stop", "left", "stop"])
+        self.assertEqual(FakeMiddleware.controls, ["left", "stop"])
         self.assertEqual(len(FakeMiddleware.queue), 1)
+
+    def _join_directly(self, name):
+        import urllib.request as u
+        req = u.Request(
+            f"http://127.0.0.1:{self.port}/queue/join",
+            data=json.dumps({"name": name}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with u.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())["token"]
+
+    def test_not_your_turn_retains_token(self):
+        """P1 regression: 403 not_your_turn must NOT clear a valid token."""
+        self._join_directly("Alice")  # Alice is controller; gadget queues behind
+        r = self.bridge.run_command("drive", {"direction": "forward", "repeats": 1})
+        self.assertFalse(r["ok"])
+        self.assertIn("not_your_turn", r["error"])
+        # Token retained: leave still works and removes only our session
+        self.assertTrue(self.bridge._state_path().exists())
+        r = self.bridge.run_command("leave", {})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual([s["name"] for s in FakeMiddleware.queue], ["Alice"])
+
+    def test_session_expired_clears_token_and_rejoins(self):
+        """Only session_expired proves the token dead; next drive re-joins."""
+        r = self.bridge.run_command("drive", {"direction": "forward", "repeats": 1})
+        self.assertTrue(r["ok"], r)
+        token = self.bridge._load_token()
+        # Middleware expires the session: token answers session_expired and
+        # the queue entry disappears (loop-side expiry in the real stack)
+        FakeMiddleware.expired_tokens.add(token)
+        FakeMiddleware.queue = [s for s in FakeMiddleware.queue if s["token"] != token]
+        r = self.bridge.run_command("drive", {"direction": "forward", "repeats": 1})
+        self.assertFalse(r["ok"])
+        self.assertIn("session_expired", r["error"])
+        self.assertFalse(self.bridge._state_path().exists())
+        FakeMiddleware.expired_tokens.discard(token)
+        r = self.bridge.run_command("drive", {"direction": "forward", "repeats": 1})
+        self.assertTrue(r["ok"], r)
+
+    def test_timeout_is_converted_not_escaped(self):
+        """P2 regression: a response timeout becomes a MiddlewareError so
+        cleanup paths run, instead of escaping as a raw TimeoutError."""
+        from unittest import mock
+        with mock.patch.object(
+            self.bridge.urllib.request, "urlopen", side_effect=TimeoutError("timed out")
+        ):
+            with self.assertRaises(self.bridge.MiddlewareError):
+                self.bridge._request("GET", "/health")
+            r = self.bridge.run_command("health", {})
+            self.assertFalse(r["ok"])
 
     def test_drive_rejects_bad_input_locally(self):
         self.assertFalse(self.bridge.run_command("drive", {"direction": "spin"})["ok"])

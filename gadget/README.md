@@ -1,15 +1,15 @@
 # Wheelson Hybrid Gadget
 
-Put Muse (Finch) on Wheelson **without touching the Wheelson firmware**.
+Put your Muse on Wheelson **without touching the Wheelson firmware**.
 
 A Linux box on the same LAN as Wheelson runs both the existing
 wheelson-explorer middleware and the Muse Gadget Linux SDK. The gadget
 registers seven narrow `wheelson.*` commands; each one calls the
-middleware's HTTP API on localhost. Finch never talks to the ESP32
+middleware's HTTP API on localhost. Your Muse never talks to the ESP32
 directly, so the explorer's safety contract survives intact:
 
 ```
-You ⇄ Muse app / chat ⇄ Finch (cloud)
+You ⇄ Muse app / chat ⇄ your Muse (cloud)
                               │  link.invoke: wheelson.*
                               ▼
                    musegadget service (Linux host)
@@ -24,7 +24,11 @@ You ⇄ Muse app / chat ⇄ Finch (cloud)
                            motors
 ```
 
-## Commands Finch gets
+## Commands your Muse gets
+
+The gadget joins the remote-control queue and chats under the name in
+`WHEELSON_GADGET_NAME` (default `Muse`). Set it to your own Muse's name
+so the dashboard shows who's driving.
 
 | Command | Middleware call | Notes |
 |---|---|---|
@@ -145,7 +149,7 @@ sudo musegadget info                              # pairing state
 sudo journalctl -u musegadget -f                  # look for: registered with the Muse
 ```
 
-Then, in chat with Finch, in order: "check the Wheelson gadget health" →
+Then, in chat with your Muse, in order: "check the Wheelson gadget health" →
 "what's Wheelson's status" (`wheelson.health`) → "switch Wheelson to
 klaus" → "take a snapshot" → "drive forward one pulse" → "leave the
 queue". First drive should be somewhere with clear floor in front and a
