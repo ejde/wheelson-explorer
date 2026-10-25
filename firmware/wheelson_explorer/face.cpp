@@ -124,9 +124,11 @@ static void drawFace(FaceExpr expr, const String& status, int lookX,
 
   sprite.fillScreen(bg);
 
-  // Ear tufts.
+#ifdef FACE_FINCH
+  // Owl ear tufts (Finch variant only).
   sprite.fillTriangle(28, 20, 44, 20, 36, 4, slate);
   sprite.fillTriangle(W - 44, 20, W - 28, 20, W - 36, 4, slate);
+#endif
 
   const int cy = 54;
   const int cx1 = W / 2 - 28;
@@ -158,13 +160,15 @@ static void drawFace(FaceExpr expr, const String& status, int lookX,
     }
   }
 
-  // Chunky black glasses: thick rounded frames + bridge + temple arms.
+#ifdef FACE_FINCH
+  // Chunky black glasses: thick rounded frames + temple arms (Finch only).
   for (int k = 0; k < 5; k++) {
     sprite.drawRoundRect(cx1 - 30 + k, 20 + k, 60 - 2 * k, 68 - 2 * k, 12, dark);
     sprite.drawRoundRect(cx2 - 30 + k, 20 + k, 60 - 2 * k, 68 - 2 * k, 12, dark);
   }
   sprite.fillRect(0, 50, 22, 6, dark);
   sprite.fillRect(W - 22, 50, 22, 6, dark);
+#endif
 
   // Worried brows when stuck.
   if (expr == FACE_STUCK) {
@@ -174,8 +178,16 @@ static void drawFace(FaceExpr expr, const String& status, int lookX,
     sprite.drawLine(cx2 - 4, 21, cx2 + 24, 13, white);
   }
 
-  // Beak.
+#ifdef FACE_FINCH
+  // Beak (Finch variant only).
   sprite.fillTriangle(W / 2 - 8, 88, W / 2 + 8, 88, W / 2, 100, orange);
+#else
+  // Generic face: a small smile.
+  for (int t = -1; t <= 1; t++) {
+    sprite.drawLine(W / 2 - 12, 96 + t, W / 2, 104 + t, slate);
+    sprite.drawLine(W / 2, 104 + t, W / 2 + 12, 96 + t, slate);
+  }
+#endif
 
   // Status bar.
   sprite.fillRect(0, H - 20, W, 20, bar);

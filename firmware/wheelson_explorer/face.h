@@ -1,4 +1,11 @@
-// Finch face for the Wheelson display.
+// Assistant face for the Wheelson display.
+//
+// The DEFAULT face is a generic assistant face: friendly eyes, no
+// identity-specific features, so anyone building this firmware gets
+// their own assistant's face, not someone else's.
+// Define FACE_FINCH at build time for the Finch variant (owl tufts,
+// chunky glasses, beak), e.g.:
+//   arduino-cli compile --build-property compiler.cpp.extra_flags=-DFACE_FINCH ...
 //
 // Hardware (from CircuitMess Wheelson-Library, WheelsonDisplay.cpp):
 //   ST7735S panel, 128x160, SPI VSPI_HOST, SCLK GPIO 2, MOSI GPIO 13,
