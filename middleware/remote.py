@@ -141,6 +141,18 @@ async def _chat_response(message: str, name: str) -> str:
 # ---------------------------------------------------------------------------
 # Route functions
 # ---------------------------------------------------------------------------
+def _prune_expired_sessions(now):
+    """Drop sessions past their control budget; True if the head was dropped.
+
+    Callers hold _queue_lock. Without this, an expired session lingers
+    and blocks re-joining under the same name (409 already_in_queue)
+    even though remote_control would reject it as session_expired.
+    """
+    head = _control_queue[0] if _control_queue else None
+    _control_queue[:] = [s for s in _control_queue if (now - s.joined_at) <= CONTROL_BUDGET_SEC]
+    return head is not None and all(s is not head for s in _control_queue)
+
+
 async def queue_join(req: JoinQueueRequest) -> JSONResponse:
     name = req.name.strip()[:32]
     if not name:
@@ -148,6 +160,10 @@ async def queue_join(req: JoinQueueRequest) -> JSONResponse:
     token = secrets.token_urlsafe(16)
     async with _queue_lock:
         now = asyncio.get_event_loop().time()
+        if _prune_expired_sessions(now) and _state_module._motion_supervisor is not None:
+            # The expired controller can no longer command; hand the
+            # motors back cleanly, mirroring queue_leave.
+            await _state_module._motion_supervisor.release_remote()
         # Don't allow the same name to join twice
         if any(s.name == name for s in _control_queue):
             return JSONResponse({"error": "already_in_queue"}, status_code=409)
@@ -207,6 +223,7 @@ async def switch_persona(req: PersonaRequest) -> JSONResponse:
 async def queue_status() -> JSONResponse:
     async with _queue_lock:
         now = asyncio.get_event_loop().time()
+        _prune_expired_sessions(now)
         entries = [
             {
                 "name": s.name,
