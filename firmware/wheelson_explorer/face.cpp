@@ -256,7 +256,11 @@ static void faceTaskFn(void*) {
 void faceInit() {
   faceMutex = xSemaphoreCreateMutex();
   lcd.init();
-  lcd.setRotation(1);  // landscape: 160x128
+  // Panel_LCD: _internal = ((r + offset) & 3) | ((r & 4) ^ (offset & 4)).
+  // With offset_rotation 6, rotations 0-3 all land mirrored (flip bit set);
+  // only 5 and 7 give non-mirrored landscape (160x128). 5 first: if the
+  // face comes up upside-down, 7 is the other one.
+  lcd.setRotation(5);  // landscape: 160x128, non-mirrored
   sprite.setPsram(true);
   if (!sprite.createSprite(lcd.width(), lcd.height())) {
     Serial.println("[FACE] sprite alloc failed");
