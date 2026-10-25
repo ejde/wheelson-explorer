@@ -34,6 +34,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include "motion_profile.h"
+#include "face.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -1017,6 +1018,33 @@ void handleOptions() {
 
 // ─── SETUP & LOOP ────────────────────────────────────────────────────────────
 
+/**
+ * POST /face
+ * Body: { "expression": "idle|explore|think|stuck|happy",
+ *         "status": "short line", "look_x": -10..10, "look_y": -10..10 }
+ * One-shot override (10 s hold); the face then falls back to nav state.
+ * Used by the middleware to mirror persona/activity on the screen.
+ */
+void handleFace() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+  String body = server.arg("plain");
+  String exprS = extractJsonString(body, "expression");
+  FaceExpr e = FACE_IDLE;
+  if (exprS == "explore") e = FACE_EXPLORE;
+  else if (exprS == "think") e = FACE_THINK;
+  else if (exprS == "stuck") e = FACE_STUCK;
+  else if (exprS == "happy") e = FACE_HAPPY;
+  String status = extractJsonString(body, "status");
+  int dx = extractJsonString(body, "look_x").toInt();
+  int dy = extractJsonString(body, "look_y").toInt();
+  faceSetOverride(e, status, dx, dy, 10000);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -1045,6 +1073,7 @@ void setup() {
     Serial.println("Motor task allocation failed"); while (true) delay(1000);
   }
   Serial.println("[MOTORS] I2C ready");
+  faceInit();  // Finch face on the TFT (also switches backlight on)
 
   // Camera
   if (!initCamera()) {
@@ -1073,6 +1102,7 @@ void setup() {
   server.on("/camera", HTTP_GET, handleCamera);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/move", HTTP_POST, handleMove);
+  server.on("/face", HTTP_POST, handleFace);
   server.on("/camera", HTTP_OPTIONS, handleOptions);
   server.on("/move", HTTP_OPTIONS, handleOptions);
   server.begin();
@@ -1087,6 +1117,23 @@ void setup() {
 void loop() {
   server.handleClient();
   syncMotorEvent();
+
+  // Mirror nav/safety state onto the face twice a second (the face task
+  // prefers a /face override while one is active).
+  static uint32_t lastFaceSync = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastFaceSync >= 500) {
+    lastFaceSync = nowMs;
+    faceSetAutoExpr(safetyStopLatched  ? FACE_STUCK
+                     : navState == NAV_CRUISE ? FACE_EXPLORE
+                                              : FACE_IDLE);
+    String st = String(navStateName(navState));
+    if (safetyStopLatched && safetyStopReason.length()) {
+      st += ": ";
+      st += safetyStopReason;
+    }
+    faceSetAutoStatus(st);
+  }
 
   unsigned long now = millis();
 
