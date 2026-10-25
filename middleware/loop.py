@@ -152,6 +152,12 @@ async def explorer_loop() -> None:
         )
         last_frame_id = 0
         planning_generation = 0
+        # VLM validity generation: advances ONLY on safety-critical regime
+        # changes (persona switch, human takeover/resume, safety event).
+        # Recovery triggers and transient firmware-busy rejections bump
+        # planning_generation but NOT this: they fire repeatedly inside one
+        # ~20s VLM round trip, which discarded every result (generation churn).
+        vlm_generation = 0
         started_at = asyncio.get_running_loop().time()
 
         await motion.start()
@@ -282,6 +288,7 @@ async def explorer_loop() -> None:
                         state.personality_key = _new_persona
                         planner.set_persona(_new_persona)
                         planning_generation += 1
+                        vlm_generation += 1  # persona change invalidates in-flight VLM plans
                         executive.cancel("persona_changed")
                         state.last_vlm_strategy = None
                         state.last_strategy_update_ts = 0.0
@@ -324,7 +331,7 @@ async def explorer_loop() -> None:
                         try:
                             vlm_update = vlm_task.result()
                             discard_reason = vlm_discard_reason(
-                                vlm_update, planning_generation, now_ts, VLM_OBSERVATION_MAX_AGE_SEC
+                                vlm_update, vlm_generation, now_ts, VLM_OBSERVATION_MAX_AGE_SEC
                             )
                             if discard_reason is not None:
                                 raise VLMResponseError(f"Discarded stale observation ({discard_reason})", "")
@@ -426,7 +433,7 @@ async def explorer_loop() -> None:
                         )
                     )
                     if should_refresh_vlm:
-                        vlm_task = asyncio.create_task(request_strategy(bytes(jpeg_bytes), dict(telemetry), system, planning_generation))
+                        vlm_task = asyncio.create_task(request_strategy(bytes(jpeg_bytes), dict(telemetry), system, vlm_generation))
                         last_vlm_request_ts = now_ts
 
                     strategy_age = (
@@ -508,6 +515,7 @@ async def explorer_loop() -> None:
                             planner.reset_maneuver()
                             executive.cancel("human_takeover")
                             planning_generation += 1
+                            vlm_generation += 1  # human takeover invalidates in-flight VLM plans
                             state.last_vlm_strategy = None
                             state.last_strategy_update_ts = 0.0
                             recovery.reset()
@@ -527,6 +535,7 @@ async def explorer_loop() -> None:
                             await motion.release_remote(only_if_inactive=True)
                             planner.reset_maneuver()
                             planning_generation += 1
+                            vlm_generation += 1  # autonomy resumes after human control
                             state.last_vlm_strategy = None
                             state.last_strategy_update_ts = 0.0
                             log.info("\U0001f916 [REMOTE] Autonomy resumed after '%s'", state.remote_controller_name)
@@ -552,6 +561,9 @@ async def explorer_loop() -> None:
                         elif trigger:
                             executive.cancel("recovery")
                             planning_generation += 1
+                            # NOTE: recovery does NOT bump vlm_generation: recovery
+                            # nudges fire inside a VLM round trip, and a room-level
+                            # VLM plan stays usable after a short autonomous recovery.
                             state.last_vlm_strategy = None
                             planner.reset_maneuver()
                             reactive_thought = _persona_reactive_thought(state.personality_key, trigger.level)
@@ -599,6 +611,11 @@ async def explorer_loop() -> None:
                         executive.cancel("firmware_rejected")
                         planner.reset_maneuver()
                         planning_generation += 1
+                        if result.safety:
+                            # A safety event changes the situation: in-flight VLM
+                            # plans must not execute. Transient busy rejections
+                            # do not invalidate them.
+                            vlm_generation += 1
                         state.last_vlm_strategy = None
                         state.executive = executive.snapshot()
 
