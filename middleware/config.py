@@ -19,7 +19,18 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 LOOP_INTERVAL = max(0.05, min(0.2, float(os.getenv("LOOP_INTERVAL_SEC", "0.1"))))
 CAMERA_INTERVAL_SEC = max(0.05, min(0.4, float(os.getenv("CAMERA_INTERVAL_SEC", "0.15"))))
 PERCEPTION_MAX_AGE_SEC = float(os.getenv("PERCEPTION_MAX_AGE_SEC", "0.8"))
-MOTION_REQUEST_TIMEOUT_SEC = 0.35
+# Cap on one /camera fetch inside the producer, so a hung request can never
+# stall the feed (the robot-side fetch itself allows up to 10 s).
+CAMERA_FETCH_TIMEOUT_SEC = float(os.getenv("CAMERA_FETCH_TIMEOUT_SEC", "3.0"))
+# Expired snapshots before the loop restarts the camera producer once.
+CAMERA_OUTAGE_RESTART_AFTER = int(os.getenv("CAMERA_OUTAGE_RESTART_AFTER", "5"))
+# Throttle for repeated camera-outage / acquisition-failure log lines.
+CAMERA_OUTAGE_LOG_INTERVAL_SEC = float(os.getenv("CAMERA_OUTAGE_LOG_INTERVAL_SEC", "30.0"))
+# Raised from 0.35 (2026-10-25): the old cap tripped constantly on the
+# Pi-robot link (77 failed renewals in ~12 min), mostly ESP32 HTTP
+# contention with camera fetches. Still under the 750 ms firmware motor
+# lease, so a genuinely dead robot is still caught by the lease watchdog.
+MOTION_REQUEST_TIMEOUT_SEC = 0.6
 AUTONOMY_RENEWAL_WINDOW_SEC = 0.8
 PORT = int(os.getenv("PORT", "8000"))
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -40,6 +51,14 @@ OLLAMA_VLM_TIMEOUT_SEC = float(os.getenv("OLLAMA_VLM_TIMEOUT_SEC", "14.0"))
 OLLAMA_TIMEOUT_BACKOFF_SEC = float(os.getenv("OLLAMA_TIMEOUT_BACKOFF_SEC", "24.0"))
 STRATEGY_STALE_MULTIPLIER = 2.0
 SEMANTIC_TTL_SEC = float(os.getenv("SEMANTIC_TTL_SEC", "18.0"))
+# How old a VLM observation may be when its task completes and still be
+# consumed (2026-10-25). Must exceed the 20 s OpenRouter VLM timeout:
+# with the old 18 s window, normal 18-20 s round trips arrived "stale"
+# and were discarded, pinning the loop in degraded local mode. Motor
+# steps are still bounded by captured_at + SEMANTIC_TTL_SEC, and scene
+# labels are reconciled against fresh telemetry every cycle, so a
+# 30 s-old scene cannot mask a new obstacle.
+VLM_OBSERVATION_MAX_AGE_SEC = float(os.getenv("VLM_OBSERVATION_MAX_AGE_SEC", "30.0"))
 SEMANTIC_HARD_CONFIRM_FRAMES = int(os.getenv("SEMANTIC_HARD_CONFIRM_FRAMES", "2"))
 SEMANTIC_BLOCKED_CONFIRM_FRAMES = int(os.getenv("SEMANTIC_BLOCKED_CONFIRM_FRAMES", "2"))
 STRATEGY_TIMEOUT_WINDOW_SEC = float(os.getenv("STRATEGY_TIMEOUT_WINDOW_SEC", "90.0"))

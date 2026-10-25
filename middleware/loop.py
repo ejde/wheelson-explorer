@@ -35,6 +35,7 @@ from config import (
     OLLAMA_TIMEOUT_BACKOFF_SEC,
     STRATEGY_STALE_MULTIPLIER,
     SEMANTIC_TTL_SEC,
+    VLM_OBSERVATION_MAX_AGE_SEC,
     STRATEGY_TIMEOUT_WINDOW_SEC,
     STRATEGY_TIMEOUT_STAGE2_COUNT,
     STRATEGY_TIMEOUT_STAGE3_COUNT,
@@ -42,6 +43,8 @@ from config import (
     CONTROL_BUDGET_SEC,
     CONTROL_INACTIVITY_SEC,
     MOVE_ACTIONS,
+    CAMERA_OUTAGE_RESTART_AFTER,
+    CAMERA_OUTAGE_LOG_INTERVAL_SEC,
 )
 import config as _config_module
 from scene import (
@@ -60,9 +63,9 @@ from scene import (
 )
 from motion import MotionSupervisor, WheelsonClient
 from planner import IntentPlanner
-from perception import CameraStream
+from perception import CameraStream, CameraOutage
 from executive import SkillExecutive
-from skills import observation_is_current
+from skills import vlm_discard_reason
 from recovery import RecoveryController, RecoveryTrigger
 
 log = logging.getLogger("wheelson")
@@ -143,6 +146,10 @@ async def explorer_loop() -> None:
         recovery = RecoveryController()
         executive = SkillExecutive()
         camera = CameraStream(wheelson)
+        outage = CameraOutage(
+            restart_after=CAMERA_OUTAGE_RESTART_AFTER,
+            log_interval_sec=CAMERA_OUTAGE_LOG_INTERVAL_SEC,
+        )
         last_frame_id = 0
         planning_generation = 0
         started_at = asyncio.get_running_loop().time()
@@ -236,6 +243,9 @@ async def explorer_loop() -> None:
                 cycle_start = loop.time()
                 try:
                     jpeg_bytes, telemetry = camera.snapshot(loop.time())
+                    if outage.note_recovered():
+                        log.info("\U0001f4f7 [CAMERA] Feed recovered after outage; resuming")
+                    state.camera_feed = camera.status()
                     new_frame = telemetry["frame_id"] != last_frame_id
                     telemetry["new_frame"] = new_frame
                     # Protocol 2 firmware supplies upright frames to every consumer.
@@ -313,8 +323,11 @@ async def explorer_loop() -> None:
                     if vlm_task and vlm_task.done():
                         try:
                             vlm_update = vlm_task.result()
-                            if not observation_is_current(vlm_update, planning_generation, now_ts, SEMANTIC_TTL_SEC):
-                                raise VLMResponseError("Discarded stale observation or persona generation", "")
+                            discard_reason = vlm_discard_reason(
+                                vlm_update, planning_generation, now_ts, VLM_OBSERVATION_MAX_AGE_SEC
+                            )
+                            if discard_reason is not None:
+                                raise VLMResponseError(f"Discarded stale observation ({discard_reason})", "")
                             state.last_vlm_strategy = None if motion.remote_owned else vlm_update.get("strategy")
                             state.last_vlm_frame_id = vlm_update["frame_id"]
                             state.last_vlm_capture_ts = vlm_update["captured_at"]
@@ -734,9 +747,31 @@ async def explorer_loop() -> None:
                     await stop_with_failsafe("invalid VLM response")
                     await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
                 except Exception as exc:
-                    log.error("\U0001f4a5 [LOOP] Unexpected error: %s", exc, exc_info=True)
-                    await stop_with_failsafe("unexpected middleware loop error")
-                    await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
+                    if "expired" in str(exc):
+                        # Dead camera feed: hold the robot, say so once,
+                        # restart the producer once, then stay quiet until
+                        # frames return. No traceback spam, no driving on
+                        # stale vision. The lease watchdog covers motion:
+                        # no renewals are issued while snapshots fail.
+                        action = outage.note_expired(loop.time())
+                        state.camera_feed = camera.status()
+                        if action == "log":
+                            log.warning("\U0001f4f7 [CAMERA] Feed lost (%s); holding", exc)
+                            await stop_with_failsafe("camera feed lost")
+                        elif action == "restart":
+                            log.warning(
+                                "\U0001f4f7 [CAMERA] Feed still lost after %d expired snapshots; "
+                                "restarting camera producer",
+                                outage.count,
+                            )
+                            await stop_with_failsafe("camera feed lost; restarting producer")
+                            with contextlib.suppress(Exception):
+                                await camera.restart()
+                        await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
+                    else:
+                        log.error("\U0001f4a5 [LOOP] Unexpected error: %s", exc, exc_info=True)
+                        await stop_with_failsafe("unexpected middleware loop error")
+                        await asyncio.sleep(FAILSAFE_BACKOFF_SEC)
 
                 elapsed = loop.time() - cycle_start
                 await asyncio.sleep(max(0.0, LOOP_INTERVAL - elapsed))

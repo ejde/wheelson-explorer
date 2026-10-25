@@ -1,0 +1,7 @@
+{
+  "sketch": "wheelson_explorer.ino",
+  "board": "esp32:esp32:esp32",
+  "configuration": "PSRAM=enabled,PartitionScheme=huge_app",
+  "port": "/dev/ttyUSB0",
+  "output": "build"
+}

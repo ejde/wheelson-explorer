@@ -77,6 +77,7 @@ async def health() -> JSONResponse:
             "personality": state.personality_key,
             "personality_name": p["name"],
             "cycle_count": state.cycle_count,
+            "camera_feed": state.camera_feed,
             "hard_stops": state.hard_stop_count,
             "last_action": state.last_action,
             "last_thought": state.last_thought[:80],

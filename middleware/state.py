@@ -75,6 +75,7 @@ class AppState:
 
     exploration_memory: list = field(default_factory=list)
     event_log: list = field(default_factory=list)
+    camera_feed: dict = field(default_factory=dict)
     is_running: bool = False
     runtime_error: str = ""
 

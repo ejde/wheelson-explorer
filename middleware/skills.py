@@ -10,9 +10,27 @@ SKILL_DIRECTIONS = {
 
 
 def observation_is_current(result: dict, generation: int, now: float, ttl: float) -> bool:
+    return vlm_discard_reason(result, generation, now, ttl) is None
+
+
+def vlm_discard_reason(result: dict, generation: int, now: float, ttl: float) -> str | None:
+    """Why observation_is_current() rejects a VLM update, or None if current.
+
+    The loop logs this instead of a generic message, so the next
+    age-vs-generation mystery is diagnosable from the log alone. (The
+    old message blamed "persona generation" for what was always this
+    currency check; persona narration fails JSON parsing elsewhere
+    with its own message.)
+    """
+    if result.get("generation") != generation:
+        return f"generation changed (task {result.get('generation')} != current {generation})"
     captured = result.get("captured_at")
-    return (result.get("generation") == generation and isinstance(captured, (int, float))
-            and math.isfinite(captured) and 0 <= now - captured < ttl)
+    if not isinstance(captured, (int, float)) or not math.isfinite(captured):
+        return "captured_at missing or not finite"
+    age = now - captured
+    if not 0 <= age < ttl:
+        return f"observation age {age:.1f}s outside [0, {ttl}s)"
+    return None
 
 
 def validate_strategy(value: object) -> dict | None:
