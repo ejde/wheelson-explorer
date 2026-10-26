@@ -14,6 +14,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from state import state, _sse_subscribers
 from config import PERSONALITIES, WHEELSON_IP
+from personas import (
+    apply_custom_personas,
+    builtin_persona_keys,
+    describe_personas,
+    load_custom_personas,
+)
 
 
 async def dashboard() -> str:
@@ -113,3 +119,26 @@ async def health() -> JSONResponse:
             "wheelson_ip": WHEELSON_IP,
         }
     )
+
+
+async def personas_list() -> JSONResponse:
+    return JSONResponse({"active": state.personality_key, "personas": describe_personas()})
+
+
+async def personas_reload() -> JSONResponse:
+    try:
+        customs = load_custom_personas()
+    except ValueError as exc:
+        return JSONResponse({"error": "invalid_personas_file", "detail": str(exc)}, status_code=400)
+    available = builtin_persona_keys() | set(customs)
+    if state.personality_key not in available:
+        return JSONResponse(
+            {
+                "error": "active_persona_would_be_removed",
+                "persona": state.personality_key,
+                "hint": "Switch to another persona first, then reload.",
+            },
+            status_code=409,
+        )
+    applied = apply_custom_personas(customs)
+    return JSONResponse({"ok": True, "applied": applied, "active": state.personality_key})

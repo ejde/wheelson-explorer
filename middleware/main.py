@@ -11,6 +11,10 @@ Usage
     python main.py --personality klaus
     python main.py --personality zog7
 
+Custom personas: define your own in middleware/personas.yaml
+(see middleware/PERSONAS.md). They appear in --personality choices,
+POST /persona, and GET /personas after a restart or POST /personas/reload.
+
 Dashboard
     http://localhost:8000
 """
@@ -30,7 +34,7 @@ from config import (
 )
 import config as _config_module
 from loop import explorer_loop
-from routes import dashboard, sse_stream, snapshot, health
+from routes import dashboard, sse_stream, snapshot, health, personas_list, personas_reload
 from remote import (
     JoinQueueRequest,
     LeaveQueueRequest,
@@ -119,6 +123,16 @@ async def _switch_persona(req: PersonaRequest):
     return await switch_persona(req)
 
 
+@app.get("/personas")
+async def _personas_list():
+    return await personas_list()
+
+
+@app.post("/personas/reload")
+async def _personas_reload():
+    return await personas_reload()
+
+
 @app.get("/queue/status")
 async def _queue_status():
     return await queue_status()
@@ -144,6 +158,10 @@ async def _health():
 # ---------------------------------------------------------------------------
 def main() -> None:
     import uvicorn
+
+    from personas import apply_custom_personas
+
+    apply_custom_personas()
 
     parser = argparse.ArgumentParser(
         description="Wheelson Explorer \u2014 AI-powered autonomous robot middleware"

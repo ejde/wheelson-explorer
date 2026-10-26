@@ -108,6 +108,8 @@ Each persona has distinct:
 
 Personas can be switched live from the dashboard or via `POST /persona` without restarting the middleware.
 
+Custom personas: define your own in `middleware/personas.yaml` (copy `middleware/personas.example.yaml` to start). Each persona carries its own movement presets (speed, safety/curiosity/perimeter weights, wall preference, burst, hold bias, turn duration) plus its voice (system prompt, salience, commentary style). Reload them live with `POST /personas/reload`, or list them with `GET /personas`. The Finch persona ships as a commented example in `middleware/personas.example.yaml`. See `middleware/PERSONAS.md` for the full field reference.
+
 ## Repository Structure
 
 ```text

@@ -4,3 +4,5 @@ httpx
 Pillow
 google-genai
 python-dotenv
+
+pyyaml
