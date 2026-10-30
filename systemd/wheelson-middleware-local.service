@@ -1,0 +1,16 @@
+[Unit]
+Description=Wheelson Explorer middleware (local mode: localhost only, dashboard via SSH tunnel)
+After=network-online.target
+Wants=network-online.target
+Conflicts=wheelson-middleware.service wheelson-middleware-lan.service
+
+[Service]
+Type=simple
+User=erice
+WorkingDirectory=/home/erice/Work/wheelson-explorer/middleware
+ExecStart=/home/erice/Work/wheelson-explorer/middleware/.venv/bin/python main.py --personality benson --provider openrouter --host 127.0.0.1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
