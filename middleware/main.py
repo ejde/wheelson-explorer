@@ -156,13 +156,8 @@ async def _health():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main() -> None:
-    import uvicorn
-
-    from personas import apply_custom_personas
-
-    apply_custom_personas()
-
+def build_parser() -> argparse.ArgumentParser:
+    """Command-line parser for the middleware (extracted for testability)."""
     parser = argparse.ArgumentParser(
         description="Wheelson Explorer \u2014 AI-powered autonomous robot middleware"
     )
@@ -186,7 +181,23 @@ def main() -> None:
         help="Model name override. Defaults: gemini=gemini-2.5-flash, openrouter=qwen/qwen3-vl-30b-a3b-instruct, ollama=llava",
     )
     parser.add_argument("--port", type=int, default=PORT, help="Dashboard port (default: 8000)")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Bind address: 0.0.0.0 listens on all interfaces (LAN mode); "
+        "127.0.0.1 listens on localhost only (local mode, dashboard via SSH tunnel).",
+    )
+    return parser
+
+
+def main() -> None:
+    import uvicorn
+
+    from personas import apply_custom_personas
+
+    apply_custom_personas()
+
+    args = build_parser().parse_args()
 
     _config_module.PROVIDER = args.provider
     if args.model:
@@ -218,7 +229,7 @@ def main() -> None:
     log.info("  Dashboard   : http://localhost:%d", args.port)
     log.info("\u2550" * 55)
 
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

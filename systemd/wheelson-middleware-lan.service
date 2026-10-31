@@ -1,0 +1,16 @@
+[Unit]
+Description=Wheelson Explorer middleware (LAN mode: listens on all interfaces)
+After=network-online.target
+Wants=network-online.target
+Conflicts=wheelson-middleware.service wheelson-middleware-local.service
+
+[Service]
+Type=simple
+User=erice
+WorkingDirectory=/home/erice/Work/wheelson-explorer/middleware
+ExecStart=/home/erice/Work/wheelson-explorer/middleware/.venv/bin/python main.py --personality benson --provider openrouter --host 0.0.0.0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

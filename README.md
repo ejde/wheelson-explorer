@@ -233,6 +233,14 @@ PORT=8000
 OLLAMA_BASE_URL=http://localhost:11434
 ```
 
+### Network modes (bind)
+
+`main.py` takes `--host` (default `0.0.0.0`, the current behavior):
+- LAN mode: `--host 0.0.0.0` listens on all interfaces. Dashboard and API reachable over LAN and tailnet, as today.
+- Local mode: `--host 127.0.0.1` listens on localhost only. The gadget bridge (which always calls `http://127.0.0.1:8000`) works in both modes; the dashboard in local mode is reached through an SSH tunnel: `ssh -L 8000:localhost:8000 erice@100.83.207.93`, then open `http://localhost:8000`.
+
+Only one mode runs at a time (both bind port 8000, and the units conflict with each other). `systemd/` ships one unit per mode; install with `sudo cp systemd/wheelson-middleware-*.service /etc/systemd/system/ && sudo systemctl daemon-reload`, then `sudo systemctl disable --now wheelson-middleware` once and `sudo systemctl enable --now wheelson-middleware-local` (or `-lan`) to switch.
+
 ### Important Optional Controls
 
 ```env
