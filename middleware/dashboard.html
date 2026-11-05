@@ -267,7 +267,24 @@
     .sidebar {
       display: flex;
       flex-direction: column;
-      overflow: hidden;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    /* ── House Map ──────────────────────────────────────────────────── */
+    .map-section {
+      padding: 14px 18px;
+      background: var(--bg2);
+      border-top: 1px solid var(--border);
+    }
+
+    .map-section canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      margin-top: 8px;
+      border: 1px solid var(--border);
+      background: #000;
     }
 
     /* ── Personality Card ─────────────────────────────────────────── */
@@ -1007,6 +1024,13 @@
         </div>
       </div>
 
+      <!-- House map -->
+      <div class="map-section">
+        <div class="label">HOUSE MAP</div>
+        <canvas id="house-map"></canvas>
+        <div id="map-note" style="margin-top:6px;font-size:11px;opacity:.7"></div>
+      </div>
+
     </aside>
 
     <!-- ── Footer ─────────────────────────────────────────────────── -->
@@ -1594,6 +1618,52 @@
         setTimeout(connect, 3000);
       };
     }
+
+    // ── House map ────────────────────────────────────────────────────
+    async function loadHouseMap() {
+      const note = document.getElementById('map-note');
+      const canvas = document.getElementById('house-map');
+      try {
+        const res = await fetch('/map');
+        const data = await res.json();
+        if (data.error) { note.textContent = data.error + '.'; return; }
+        const grid = data.grid;
+        const SCALE = 2;
+        canvas.width = grid.cols * SCALE;
+        canvas.height = grid.rows * SCALE;
+        const ctx = canvas.getContext('2d');
+        const colors = {};
+        data.rooms.forEach(r => { colors[r.id] = `rgb(${r.color.join(',')})`; });
+        grid.cells.forEach((rowStr, r) => {
+          for (let c = 0; c < rowStr.length; c++) {
+            const code = parseInt(rowStr[c], 10);
+            if (code !== 0) {
+              ctx.fillStyle = colors[code] || '#333';
+              ctx.fillRect(c * SCALE, r * SCALE, SCALE, SCALE);
+            }
+          }
+        });
+        ctx.fillStyle = '#000';
+        ctx.font = `${Math.round(grid.cols / 10)}px sans-serif`;
+        ctx.textAlign = 'center';
+        data.rooms.forEach(room => {
+          const [cc, cr] = room.centroid;
+          ctx.fillText(room.name, cc * SCALE, cr * SCALE);
+        });
+        if (data.pose) {
+          const [pc, pr] = data.pose;
+          ctx.fillStyle = '#00ffd5';
+          ctx.beginPath();
+          ctx.arc(pc * SCALE, pr * SCALE, Math.max(4, grid.cols / 40), 0, 2 * Math.PI);
+          ctx.fill();
+        } else {
+          note.textContent = 'Position unknown: localization lands in Phase 2.';
+        }
+      } catch (err) {
+        note.textContent = 'Could not load house map.';
+      }
+    }
+    loadHouseMap();
 
     connect();
   </script>
