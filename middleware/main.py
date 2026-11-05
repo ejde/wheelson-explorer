@@ -25,7 +25,7 @@ import logging
 import sys
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from state import state
 from config import (
@@ -35,6 +35,7 @@ from config import (
 import config as _config_module
 from loop import explorer_loop
 from routes import dashboard, sse_stream, snapshot, health, personas_list, personas_reload
+from house_map import map_data
 from remote import (
     JoinQueueRequest,
     LeaveQueueRequest,
@@ -146,6 +147,13 @@ async def _chat_endpoint(req: ChatRequest):
 @app.get("/snapshot")
 async def _snapshot():
     return await snapshot()
+
+
+@app.get("/map")
+async def _house_map() -> JSONResponse:
+    data = map_data()
+    status = 404 if "error" in data else 200
+    return JSONResponse(data, status_code=status)
 
 
 @app.get("/health")
