@@ -29,3 +29,6 @@ firmware/**/*.map
 
 # User-defined personas (never commit personal personas)
 middleware/personas.yaml
+
+# House map (derived from the home layout; generated locally, never committed)
+middleware/map/house_map.json
